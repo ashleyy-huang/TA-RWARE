@@ -2,58 +2,90 @@ import time
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 
 import gymnasium as gym
+import numpy as np
 
 from tarware.heuristic import heuristic_episode
+from tarware.utils.logger import Logger
 
-parser = ArgumentParser(description="Run tests with vector environments on WarehouseEnv", formatter_class=ArgumentDefaultsHelpFormatter)
-
-parser.add_argument(
-        "--num_episodes",
-        default=1000,
-        type=int,
-        help="The seed to run with"
-    )
-parser.add_argument(
-        "--seed",
-        default=0,
-        type=int,
-        help="The seed to run with"
-    )
-
-parser.add_argument(
-        "--render",
-        action='store_true',
-    )
+parser = ArgumentParser(
+    description="Run heuristic baseline on TA-RWARE",
+    formatter_class=ArgumentDefaultsHelpFormatter,
+)
+parser.add_argument("--env_id", default="tarware-medium-8agvs-4pickers-partialobs-v1")
+parser.add_argument("--num_episodes", default=100, type=int)
+parser.add_argument("--seed", default=0, type=int)
+parser.add_argument("--render", action="store_true")
+parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
+parser.add_argument("--wandb_project", default="tarware")
+parser.add_argument("--log_dir", default="runs")
+parser.add_argument("--episode_offset", default=0, type=int,
+                    help="Global episode offset for W&B logging (use when running parallel workers)")
 
 args = parser.parse_args()
 
-def info_statistics(infos, global_episode_return, episode_returns):
-    _total_deliveries = 0
-    _total_clashes = 0
-    _total_stuck = 0
-    for info in infos:
-        _total_deliveries += info["shelf_deliveries"]
-        _total_clashes += info["clashes"]
-        _total_stuck += info["stucks"]
-        info["total_deliveries"] = _total_deliveries
-        info["total_clashes"] = _total_clashes
-        info["total_stuck"] = _total_stuck
-    last_info = infos[-1]
-    last_info["episode_length"] = len(infos)
-    last_info["global_episode_return"] = global_episode_return
-    last_info["episode_returns"] = episode_returns
-    return last_info
+
+def build_episode_metrics(infos, global_episode_return, episode_returns, elapsed):
+    total_deliveries = sum(i["shelf_deliveries"] for i in infos)
+    total_clashes = sum(i["clashes"] for i in infos)
+    total_stuck = sum(i["stucks"] for i in infos)
+    episode_length = len(infos)
+    pick_rate = total_deliveries * 3600 / (5 * episode_length)
+
+    return {
+        # Primary metric
+        "pick_rate": pick_rate,
+        # Returns
+        "global_return": global_episode_return,
+        "episode_returns": episode_returns.tolist(),
+        # Delivery stats
+        "total_deliveries": total_deliveries,
+        "episode_length": episode_length,
+        # Collision / stuck stats
+        "total_clashes": total_clashes,
+        "total_stuck": total_stuck,
+        # Efficiency stats (averaged over steps)
+        "avg_agvs_distance": np.mean([i["agvs_distance_travelled"] for i in infos]),
+        "avg_pickers_distance": np.mean([i["pickers_distance_travelled"] for i in infos]),
+        "avg_agvs_idle": np.mean([i["agvs_idle_time"] for i in infos]),
+        "avg_pickers_idle": np.mean([i["pickers_idle_time"] for i in infos]),
+        # Speed
+        "fps": episode_length / elapsed,
+    }
+
 
 if __name__ == "__main__":
-    env = gym.make("tarware-extralarge-14agvs-7pickers-partialobs-v1")
-    seed = args.seed
-    completed_episodes = 0
+    config = vars(args)
+    config["algo"] = "heuristic"
+
+    logger = Logger(config, log_dir=args.log_dir, use_wandb=args.wandb)
+    env = gym.make(args.env_id)
+
+    pick_rates = []
     for i in range(args.num_episodes):
         start = time.time()
-        infos, global_episode_return, episode_returns = heuristic_episode(env.unwrapped, args.render, seed+i)
-        end = time.time()
-        last_info = info_statistics(infos, global_episode_return, episode_returns)
-        last_info["overall_pick_rate"] = last_info.get("total_deliveries") * 3600 / (5 * last_info['episode_length'])
-        episode_length = len(infos)
-        print(f"Completed Episode {completed_episodes}: | [Overall Pick Rate={last_info.get('overall_pick_rate'):.2f}]| [Global return={last_info.get('global_episode_return'):.2f}]| [Total shelf deliveries={last_info.get('total_deliveries'):.2f}]| [Total clashes={last_info.get('total_clashes'):.2f}]| [Total stuck={last_info.get('total_stuck'):.2f}] | [FPS = {episode_length/(end-start):.2f}]")
-        completed_episodes += 1
+        infos, global_return, ep_returns = heuristic_episode(
+            env.unwrapped, args.render, seed=args.seed + i
+        )
+        elapsed = time.time() - start
+
+        metrics = build_episode_metrics(infos, global_return, ep_returns, elapsed)
+        pick_rates.append(metrics["pick_rate"])
+        logger.log_episode(args.episode_offset + i, metrics)
+
+        print(
+            f"Episode {i:4d} | "
+            f"Pick Rate: {metrics['pick_rate']:6.2f} | "
+            f"Deliveries: {metrics['total_deliveries']:3.0f} | "
+            f"Clashes: {metrics['total_clashes']:4.0f} | "
+            f"Stuck: {metrics['total_stuck']:3.0f} | "
+            f"FPS: {metrics['fps']:5.1f}"
+        )
+
+    print(f"\n{'='*60}")
+    print(f"Mean Pick Rate (all):    {np.mean(pick_rates):.2f}")
+    print(f"Mean Pick Rate (last 50): {np.mean(pick_rates[-50:]):.2f}  ← paper metric")
+    print(f"95% CI (last 50):        ±{1.96 * np.std(pick_rates[-50:]) / np.sqrt(50):.2f}")
+    print(f"{'='*60}")
+
+    logger.close()
+    env.close()

@@ -99,6 +99,8 @@ def heuristic_episode(env, render=False, seed=None):
                 empty_location_ids = list(non_goal_location_ids[empty_shelves > 0])
                 assigned_item_loc_agvs = [mission.location_id for mission in assigned_agvs.values()]
                 empty_location_ids = [loc_id for loc_id in empty_location_ids if loc_id not in assigned_item_loc_agvs]
+                if not empty_location_ids:
+                    continue
                 empty_location_yx = [location_map[i] for i in empty_location_ids]
                 closest_empty_location_paths = [env.find_path((agv.y, agv.x), (y, x), agv, care_for_agents=False) for (y,x) in empty_location_yx]
                 closest_empty_location_distances = [len(p) for p in closest_empty_location_paths]
