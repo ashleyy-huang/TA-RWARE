@@ -38,6 +38,7 @@ class Agent(Entity):
         self.fixing_clash = 0
         self.type = agent_type
         self.target = 0
+        self.task_start_step: Optional[int] = None
 
     def req_location(self, grid_size) -> Tuple[int, int]:
         if self.req_action != Action.FORWARD:
@@ -208,6 +209,15 @@ class Warehouse(gym.Env):
         return [agent.target for agent in self.agents[self.num_agvs:]]
 
     def _make_layout_from_params(self, shelf_columns: int, shelf_rows: int, column_height: int) -> None:
+        """
+        根據 shelf_columns、shelf_rows、column_height 自動建立 warehouse 的地圖 layout。做幾件事：
+        計算整個 warehouse 的 grid_size
+        初始化 self.grid
+        決定哪些 row / column 是 highway lane
+        建立 self.highways，標記每個格子是不是通道
+        建立 self.goals，也就是底部可交付/目標位置
+        建立 self.action_id_to_coords_map，把 action id 對應到地圖座標
+        """
         assert shelf_columns % 2 == 1, "Only odd number of shelf columns is supported"
         self._bottom_rows = 2
         self._highway_lanes = 2
@@ -220,6 +230,7 @@ class Warehouse(gym.Env):
         self.grid = np.zeros((len(CollisionLayers), *self.grid_size), dtype=np.int32)
 
         def get_highway_lanes_indices(axis_size, step):
+            """計算哪些 row/ column 會是通道位置"""
             return [
                 i + j
                 for i in range(
@@ -232,6 +243,10 @@ class Warehouse(gym.Env):
         highway_xs = get_highway_lanes_indices(self.grid_size[1], self.column_width)
 
         def highway_func(x, y):
+            """ 
+            建立 layout 時即時計算
+            判斷某個座標 (x, y) 是不是 highway 
+            """
             return x in highway_xs or y in highway_ys or y >= self.grid_size[0] - 1 - self._bottom_rows
 
         self.goals = [
@@ -251,6 +266,7 @@ class Warehouse(gym.Env):
                     item_loc_index+=1
 
     def _is_highway(self, x: int, y: int) -> bool:
+        """ layout 建好後，直接查已經存好的 array """
         return self.highways[y, x]
 
     def find_path(self, start, goal: Tuple[int], agent: Tuple[int], care_for_agents: bool = True) -> List[Tuple[int]]:
@@ -274,6 +290,7 @@ class Warehouse(gym.Env):
         """
         grid = np.zeros(self.grid_size)
         if care_for_agents:
+            # 如果 care_for_agents=True，就把目前 AGV 和 Picker 佔據的位置也加進 grid，當成障礙物
             grid += self.grid[CollisionLayers.AGVS]
             grid += self.grid[CollisionLayers.PICKERS]
         # Agents should start a path regardless if some others are waiting around the target location
@@ -281,30 +298,59 @@ class Warehouse(gym.Env):
 
         if agent.type == AgentType.PICKER:
             # Pickers can only travel through the highway, but can access goal locations
+            # highway = 1，非 highway = 0
+            # picker 主要只能走 highway，不能像 AGV 一樣在 rack/shelf 自由穿梭
             grid += (1-self.highways)
             grid[goal[0], goal[1]] -= not self._is_highway(goal[1], goal[0])
             for i in range(self.grid_size[1]):
                 grid[self.grid_size[0] - 1, i] = 1
 
-        # Ban Pickers crossing through racks if adjacent target location is chosen and force them thake the long way around.
-        start_fix = (0, 0)
-        if agent.type == AgentType.PICKER and  ((not self._is_highway(start[1], start[0])) and goal[0] == start[0] and abs(goal[1] - start[1]) == 1):
-            if self._is_highway(start[1] - 1, start[0]):
-                start_fix = (0, - 1)
-            if self._is_highway(start[1] + 1, start[0]):
-                start_fix = (0, 1)
-            grid[start[0], start[1]] = 1
+        # If a Picker starts inside a non-highway rack location and its target is adjacent,
+        # force the path to re-enter the highway first instead of cutting directly through racks.
+        """
+        不想要：
+        Picker 在 shelf A -> 直接走到隔壁 shelf B
 
-        grid[start[0]+start_fix[0], start[1]+start_fix[1]] = 0
-        grid = [list(map(int, l)) for l in (grid!=0)]
+        想要：
+        Picker 先回 highway -> 沿 highway 繞路 -> 再進入目標 shelf 位置
+        """
+        start_fix = (0, 0)
+        if agent.type == AgentType.PICKER and  ( 
+            (not self._is_highway(start[1], start[0])) and # Picker 在 rack 裡
+            goal[0] == start[0] and # 同一 row
+            abs(goal[1] - start[1]) == 1 # 緊鄰（1格）
+            ): 
+            if self._is_highway(start[1] - 1, start[0]): # 左邊是 highway?
+                start_fix = (0, - 1)                     # 起點往左移一格
+            if self._is_highway(start[1] + 1, start[0]): # 右邊是 highway?
+                start_fix = (0, 1)                       # 起點往右移一格
+            grid[start[0], start[1]] = 1                 # 封鎖原始起點
+
+        grid[start[0]+start_fix[0], start[1]+start_fix[1]] = 0 # 確保新起點是可通行的
+
+        """
+        grid 轉換成 A* 看得懂的 -> 從有沒有東西轉換成走這一格要花幾步
+        grid != 0     →  有東西的格子=True，空格=False
+        map(int, ...) →  True=1（障礙）, False=0（可通行）
+        """
+        grid = [list(map(int, l)) for l in (grid!=0)] 
         grid = np.array(grid, dtype=np.float32)
-        grid[np.where(grid == 1)] = np.inf
-        grid[np.where(grid == 0)] = 1
+        grid[np.where(grid == 1)] = np.inf # 障礙物 = 無限成本（走不過去）
+        grid[np.where(grid == 0)] = 1      # 空格   = 成本 1（走一格算一步）
+
+        """
+        第二段：路徑裁切
+        """
         astar_path = pyastar2d.astar_path(grid, np.add(start, start_fix), goal, allow_diagonal=False) # returns None if cant find path
         # astar_path = astar_path[int(np.where(astar_path == np.add(start, start_fix))[0][0]):]
         if astar_path is not None:
             astar_path = [tuple(x) for x in list(astar_path)] # convert back to other format
+             # A* 路徑包含起點。正常情況跳過（agent 已在起點）；
+             # start_fix 情況起點被封鎖（inf），第一格是 agent 要走去的 highway，保留
+            
             astar_path = astar_path[1 - int(grid[start[0], start[1]] > 1):]
+             # astar_path[1:]   ← 跳過第一格（起點，agent 已在那裡）
+             # astar_path[0:]   ← 保留全部（第一格是要走去的 highway）
 
         if astar_path:
             return [(x, y) for y, x in astar_path]
@@ -312,6 +358,9 @@ class Warehouse(gym.Env):
             return []
 
     def _recalc_grid(self) -> None:
+        """
+        重新計算目前 warehouse 裡每一層 grid 的佔用狀態
+        """
         self.grid.fill(0)
 
         carried_shelf_ids = {agent.carrying_shelf.id for agent in self.agents if agent.carrying_shelf}
@@ -350,102 +399,240 @@ class Warehouse(gym.Env):
                     empty_item_map[id_ - len(self.goals) - 1] = 1
         return empty_item_map
 
+    # TODO : add to note
     def attribute_macro_actions(self, macro_actions: List[int]) -> Tuple[int, int]:
+        """
+        這個 function 不是真的移動 agent，
+        它只是決定每個 agent 這一步的 agent.req_action，
+        真正執行移動是在後面的 execute_micro_actions()
+        """
+
+        # Count how many AGV / Picker movement steps are planned in this environment step.
         agvs_distance_travelled = 0
         pickrs_distance_travelled = 0
+
+        """
         # Logic for Macro Actions
+        # Each agent receives one macro action.
+        # A macro action is a target location id, not a direct movement command.
+        """
         for agent, macro_action in zip(self.agents, macro_actions):
             # Initialize action for step
+            ## Default action for every step is doing nothing.
+            ## Later logic may overwrite this with FORWARD / LEFT / RIGHT / TOGGLE_LOAD.
             agent.req_action = Action.NOOP
+
             # Collision avoidance logic
+            ## If this agent is currently in a collision-fixing cooldown,
+            ## decrease the remaining cooldown time.
             if agent.fixing_clash > 0:
                 agent.fixing_clash -= 1
+
+            # Case 1: agent is idle, so it can accept a new macro action.
             if not agent.busy:
-                agent.target = 0
-                if macro_action != 0:
+                agent.target = 0 # Clear previous target because the agent is no longer working on it.
+                
+                # macro_action == 0 means no new target is assigned.
+                if macro_action != 0: # 代表有新 target
+                    # Convert the macro action id into a target coordinate,
+                    # then find a path from current position to that target.
+                    # care_for_agents=False means path planning ignores current agent positions.
                     agent.path = self.find_path((agent.y, agent.x), self.action_id_to_coords_map[macro_action], agent, care_for_agents=False)
+                   
+                    # If pathfinding succeeds, mark the agent as busy
+                    # and prepare its first low-level movement action.
                     if agent.path:
                         agent.busy = True
                         agent.target = macro_action
+
+                        # If AGV is sent to a shelf/item location,
+                        # record the start time for later delivery-time statistics.
+                        if agent.type == AgentType.AGV and macro_action > self.num_goals:
+                            agent.task_start_step = self._cur_steps
+                        
+                        # Convert the first coordinate in the path into a micro action.
+                        # Example: turn left, turn right, or move forward.
+                        # agent.path[0] : path 裡面的下一個座標 e.g agent.path[0] = (5,3)
+                        # agent 不能直接走過去(5,3)，而是要透過執行一步的 micro action 來做到 -> 執行 get_next_micro_action()
                         agent.req_action = get_next_micro_action(agent.x, agent.y, agent.dir, agent.path[0])
+                        
+                        # stuck_counters: 用來偵測 agent 有沒有一直停在同一個地方
+                        # 因為 agent pathfinding success，代表 agent 拿到新的任務 -> stuck_counters reset
                         self.stuck_counters[agent.id - 1].reset((agent.x, agent.y))
+        
+            # Case 2: agent is already busy, so it should continue its existing path.
             else:
                 # Check if agent finished the given path, if not continue the path
-                if agent.path == []:
+                if agent.path == []: # Path is empty, agent arrived target.
+                    
+                    # AGV / single AGENT 
+                    ## performs TOGGLE_LOAD after reaching the target.
+                    ## This means load or unload shelf depending on current carrying state.
                     if agent.type in [AgentType.AGV, AgentType.AGENT]:
                         agent.req_action = Action.TOGGLE_LOAD
+                    
+                    # Picker 
+                    ## does not load/unload directly here.
+                    ## Once it reaches its target, it becomes idle again.
                     if agent.type == AgentType.PICKER:
                         agent.busy = False
+                
+                # If path still has coordinates, continue moving along the path.
                 else:
+                    # Convert the next path coordinate into this step's micro action.
                     agent.req_action = get_next_micro_action(agent.x, agent.y, agent.dir, agent.path[0])
+                    
+                    # Count planned movement distance by agent type.
                     agvs_distance_travelled += int(agent.type == AgentType.AGV)
                     pickrs_distance_travelled += int(agent.type == AgentType.PICKER)
+                
+                # If only one coordinate remains, the agent is about to reach the final target.    
                 if len(agent.path) == 1:
+                    
                     # If agent is at the end of a path and carrying a shelf and the target location is already occupied, restart agent
+                    ## If an agent is carrying a shelf but the target location already has a shelf,
+                    ## stop and mark it as not busy so it can be reassigned later.
                     if agent.carrying_shelf and self.grid[CollisionLayers.SHELVES, agent.path[-1][1], agent.path[-1][0]]:
                         agent.req_action = Action.NOOP
                         agent.busy = False
+                    
                     # Logic for Pickers to load shelves if AGV is present at location or wait otherwise
+                    # Picker-specific cooperation logic:
+                    # Picker 只有在 AGV=TOGGLE_LOAD + at the target location 時才進行 interaction
                     if agent.type == AgentType.PICKER:
+                        
+                        # If no AGV is at the target, or the AGV is not loading/unloading,
+                        # the Picker waits instead of moving/finishing.
                         if (
                             self.grid[CollisionLayers.AGVS, agent.path[-1][1], agent.path[-1][0]] == 0
                             or self.agents[self.grid[CollisionLayers.AGVS, agent.path[-1][1], agent.path[-1][0]]- 1].req_action != Action.TOGGLE_LOAD
                         ):
                             agent.req_action = Action.NOOP
+                        
+                        # If an AGV is at the target and is TOGGLE_LOAD,
+                        # reset the Picker stuck counter because this waiting is intentional cooperation.
                         elif (
                             self.grid[CollisionLayers.AGVS, agent.path[-1][1], agent.path[-1][0]] != 0
                             and self.agents[self.grid[CollisionLayers.AGVS, agent.path[-1][1], agent.path[-1][0]] - 1].req_action == Action.TOGGLE_LOAD
-                            ):
+                        ):
                             self.stuck_counters[agent.id - 1].reset((agent.x, agent.y))
+        
+        # Return movement statistics for this step.
         return agvs_distance_travelled, pickrs_distance_travelled
 
+    
     def resolve_move_conflict(self, agent_list):
+        """
+        StuckCounter 追蹤每個 agent 有沒有在原地不動。
+        超過 _STUCK_THRESHOLD = 5 步就強制重新規劃路徑，再超過就直接取消任務（agent.busy = False）
+        ---
+        commited_agents 代表：這一個 step 被允許執行原本 req_action 的 agent
+        在 resolve_move_conflict() 裡，每個 agent 先在 attribute_macro_actions() 得到一個想做的動作：agent.req_action
+        -> 但不是每個動作都可以真的做，要看會不會撞車
+        """
+        
+        # 建立「每個 agent 從哪裡想移到哪裡」的 directed graph。
+        ## Store the ids of agents whose requested movement is allowed to execute.
         commited_agents = set()
+
+        ## Build a directed graph of intended movements for this step.
+        ## Each edge means: current position -> requested next position.
         G = nx.DiGraph()
+
+        ## Add one movement edge for each agent.
+        ## If the agent is not moving forward, req_location() returns its current location.
         for agent in agent_list:
             start = agent.x, agent.y
             target = agent.req_location(self.grid_size)
             G.add_edge(start, target)
+        
+        # Split the movement graph into independent connected components.
+        # Agents in different components do not directly affect each other's movement
+        # 把 graph 分成幾個互相有關的區塊，不相關的 agent 可以分開處理
         wcomps = [G.subgraph(c).copy() for c in nx.weakly_connected_components(G)]
         for comp in wcomps:
             try:
+                # 如果有 cycle，代表一群 agent 可能在輪流讓位
                 # if we find a cycle in this component we have to
                 # commit all nodes in that cycle, and nothing else
                 cycle = nx.algorithms.find_cycle(comp)
+                
+                # 2 Agent Cycle
                 if len(cycle) == 2:
                     # we have a situation like this: [A] <-> [B]
-                    # which is physically impossible. so skip
+                    # which is physically impossible.會互撞 -> so skip
                     continue
+                
+                # 三人以上的 cycle 是可以一起動的 -> 把 cycle 裡的 agent 加進 commited_agents
+                # A -> B 的位置
+                # B -> C 的位置
+                # C -> A 的位置
                 for edge in cycle:
                     start_node = edge[0]
-                    agent_id = self.grid[CollisionLayers.AGVS, start_node[1], start_node[0]]
+                    
+                    # Check whether an AGV is currently located at this start node.
+                    agent_id = self.grid[CollisionLayers.AGVS, start_node[1], start_node[0]] # 把「graph 裡的座標」轉回「實際站在那個座標上的 agent id」。
                     # action = self.agents[agent_id - 1].req_action
                     # print(f"{agent_id}: C {cycle} {action}")
+
+                    # If an AGV is found, allow AGV to execute its requested action.
                     if agent_id > 0:
                         commited_agents.add(agent_id)
                         continue
+                    
+                    # If no AGV is found, check whether a Picker is located there.
                     picker_id = self.grid[CollisionLayers.PICKERS, start_node[1], start_node[0]]
+
+                    # If a Picker is found, allow that Picker to execute its requested action.
                     if picker_id > 0:
                         commited_agents.add(picker_id)
                         continue
+            
             except nx.NetworkXNoCycle:
+                # If the component has no cycle, it is a directed acyclic movement chain.
+                # Choose the longest chain of movements to execute.
+                # 找 DAG 裡最長的一串移動鏈，讓這串 agent 優先動，其他的後面會被設成 NOOP
                 longest_path = nx.algorithms.dag_longest_path(comp)
+
+                # Commit every agent currently located on that longest movement chain.
                 for x, y in longest_path:
+                    """
+                    這邊處理的方法和上面有cycle一樣
+                    """
+                    # Check whether an AGV is located at this graph node
                     agent_id = self.grid[CollisionLayers.AGVS, y, x]
+                    
+                    # If an AGV is found, allow it to execute its requested action.
                     if agent_id:
                         commited_agents.add(agent_id)
                         continue
                     picker_id = self.grid[CollisionLayers.PICKERS, y, x]
                     if picker_id:
                         commited_agents.add(picker_id)
+
+        # Count how many movement clashes are detected in this step.
         clashes = 0
+
+        # Compare every pair of agents to catch direct movement conflicts.
         for agent in agent_list:
             for other in agent_list:
+
+                # Skip comparing the agent with itself.
                 if agent.id != other.id:
+                    
+                    # Compute where each agent wants to be after this step
                     agent_new_x, agent_new_y = agent.req_location(self.grid_size)
                     other_new_x, other_new_y = other.req_location(self.grid_size)
+                    
                     # Clash fixing logic
+                    ## Only agents with a path need clash handling here.
+                    ## A clash happens if this agent moves into:
+                    ## 1. the other agent's current position, or
+                    ## 2. the other agent's requested next position.
                     if agent.path and ((agent_new_x, agent_new_y) in [(other.x, other.y), (other_new_x, other_new_y)]):
+
+                        # 特殊情況: AGV/Picker 在 rack 協作 -> 位置不是 highway，且一個是 AGV、一個是 picker
+                        # e.g picker 在 shelf 旁邊，AGV 過來 load/unload
                         # If we are in a rack and one of the agents is a picker we ignore clashses, assumed behaviour is Picker is loading
                         if not self._is_highway(agent_new_x, agent_new_y) and (agent.type == AgentType.PICKER or other.type == AgentType.PICKER) and agent.type != other.type:
                             # Allow Pickers to step over AGVs (if no other Picker at that shelf location) or AGVs to step over Pickers (if no other AGV at that shelf location)
@@ -453,29 +640,48 @@ class Warehouse(gym.Env):
                                 or (agent.type == AgentType.AGV and self.grid[CollisionLayers.AGVS, agent_new_y, agent_new_x] in [0, agent.id])):
                                 commited_agents.add(agent.id)
                                 continue
-                        # If the agent's next action bumps it into another agent
+                        
+                        # Case 1:
+                        # Agent's next action wants to move into other agent's current cell.
                         if (agent_new_x, agent_new_y) == (other.x, other.y):
-                            agent.req_action = Action.NOOP # Stop the action
-                            # Check if the clash is not solved naturaly by the other agent moving away
+                            agent.req_action = Action.NOOP # Stop this agent for now to avoid moving into an occupied cell.
+
+                            # 檢查 other 是否真的會讓開
+                            # If the other agent stays, swaps, or also targets this cell,
+                            # the conflict is not naturally resolved.
                             if (other_new_x, other_new_y) in [(agent.x, agent.y), (agent_new_x, agent_new_y)] and not other.req_action in (Action.LEFT, Action.RIGHT):
-                                if other.fixing_clash == 0:# If the others are not already fixing the clash
+                                
+                                # 如果 other 沒有安全離開，且不是只是在原地轉向，就視為 clash
+                                if other.fixing_clash == 0: 
                                     clashes+=1
                                     agent.fixing_clash = _FIXING_CLASH_TIME # Agent start time for clash fixing
-                                    new_path = self.find_path((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), agent)
-                                    if new_path != []: # If the agent can find an alternative path, assign it if not let the other solve the clash
+                                    new_path = self.find_path((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), agent) # 開始找路
+                                    if new_path != []: 
+                                        # If the agent can find an alternative path, assign it if not let the other solve the clash
                                         agent.path = new_path
                                     else:
+                                    # If no alternative path exists, cancel the fixing cooldown.
+                                    # The agent will simply remain stopped for this step.
                                         agent.fixing_clash = 0
+                        # Case 2:
+                        # 兩個 agent 想去同一格 -> 讓兩個 agent 都停下
                         elif (agent_new_x, agent_new_y) == (other_new_x, other_new_y) and (agent_new_x, agent_new_y) != (agent.x, agent.y):
-                            # If the agent's next action bumps it into another agent position after they take actions simultaneously
                             if agent.fixing_clash == 0 and other.fixing_clash == 0:
+                                # 如果兩個 agent 都沒有在 handle clash，stop this agent and mark it as fixing collision
                                 agent.req_action = Action.NOOP # If the agent's actions leads them in the position of another STOP
                                 agent.fixing_clash = _FIXING_CLASH_TIME  # Agent wait one step while the other moves into place
-
+        
+        # Convert committed agent ids into actual Agent objects.
         commited_agents = set([self.agents[id_ - 1] for id_ in commited_agents])
+        
+        # Agents not committed by the graph logic are not allowed to move this step.
         failed_agents = set(agent_list) - commited_agents
+
+        # Force all failed agents to stay still.
         for agent in failed_agents:
             agent.req_action = Action.NOOP
+        
+        # Return the number of detected clashes for logging/statistics.
         return clashes
 
     def resolve_stuck_agents(self) -> None:
@@ -586,6 +792,7 @@ class Warehouse(gym.Env):
 
     def process_shelf_deliveries(self, rewards: np.ndarray[int]) -> np.ndarray[int]:
         shelf_deliveries = 0
+        delivery_travel_times = []
         for y, x in self.goals:
             shelf_id = self.grid[CollisionLayers.CARRIED_SHELVES, x, y]
             if not shelf_id  or self.shelfs[shelf_id - 1] not in self.request_queue:
@@ -604,6 +811,9 @@ class Warehouse(gym.Env):
                     rewards += 1
                 elif self.reward_type == RewardType.INDIVIDUAL:
                     rewards[agent.id - 1] += 1
+                if agent.task_start_step is not None:
+                    delivery_travel_times.append(self._cur_steps - agent.task_start_step)
+                    agent.task_start_step = None
             shelf_deliveries += 1
 
         if shelf_deliveries:
@@ -611,7 +821,7 @@ class Warehouse(gym.Env):
         else:
             self._cur_inactive_steps += 1
 
-        return rewards, shelf_deliveries
+        return rewards, shelf_deliveries, delivery_travel_times
 
     def reset(self, seed=None, options=None)-> Tuple:
         # Reset counters
@@ -675,7 +885,7 @@ class Warehouse(gym.Env):
         # Execute micro actions
         rewards = self.execute_micro_actions(rewards)
         # Process shelf deliveries
-        rewards, shelf_deliveries = self.process_shelf_deliveries(rewards)
+        rewards, shelf_deliveries, delivery_travel_times = self.process_shelf_deliveries(rewards)
 
         self._recalc_grid()
         self._cur_steps += 1
@@ -695,6 +905,7 @@ class Warehouse(gym.Env):
             clashes_count,
             stucks_count,
             shelf_deliveries,
+            delivery_travel_times,
         )
         return new_obs, list(rewards), terminateds, terminateds, info
 
@@ -705,9 +916,10 @@ class Warehouse(gym.Env):
         clashes_count: int,
         stucks_count:  int,
         shelf_deliveries: int,
+        delivery_travel_times: List[int],
     ) -> Dict[str, np.ndarray]:
         info = {}
-        agvs_idle_time = sum([int(agent.req_action in (Action.NOOP, Action.TOGGLE_LOAD)) for agent in self.agents[:self.num_agvs]])
+        agvs_idle_time = sum([int(agent.req_action in (Action.NOOP, Action.TOGGLE_LOAD)) for agent in self.agents[:self.num_agvs]]) 
         pickers_idle_time = sum([int(agent.req_action in (Action.NOOP, Action.TOGGLE_LOAD)) for agent in self.agents[self.num_agvs:]])
         info["vehicles_busy"] = [agent.busy for agent in self.agents]
         info["shelf_deliveries"] = shelf_deliveries
@@ -717,6 +929,7 @@ class Warehouse(gym.Env):
         info["pickers_distance_travelled"] = pickers_distance_travelled
         info["agvs_idle_time"] = agvs_idle_time
         info["pickers_idle_time"] = pickers_idle_time
+        info["delivery_travel_times"] = delivery_travel_times
         return info
 
     def compute_valid_action_masks(self, pickers_to_agvs=True, block_conflicting_actions=True):
