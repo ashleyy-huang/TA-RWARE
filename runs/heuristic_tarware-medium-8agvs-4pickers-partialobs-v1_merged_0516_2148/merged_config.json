@@ -1,0 +1,82 @@
+{
+  "env_id": "tarware-medium-8agvs-4pickers-partialobs-v1",
+  "algo": "heuristic",
+  "sources": [
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_0_0516_2042",
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_1250_0516_2042",
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_2500_0516_2042",
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_3750_0516_2042",
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_5000_0516_2042",
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_6250_0516_2042",
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_7500_0516_2042",
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_8750_0516_2042"
+  ],
+  "seed_ranges": [
+    [
+      0,
+      1250
+    ],
+    [
+      1250,
+      2500
+    ],
+    [
+      2500,
+      3750
+    ],
+    [
+      3750,
+      5000
+    ],
+    [
+      5000,
+      6250
+    ],
+    [
+      6250,
+      7500
+    ],
+    [
+      7500,
+      8750
+    ],
+    [
+      8750,
+      10000
+    ]
+  ],
+  "source_actual_counts": {
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_0_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_1250_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_2500_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_3750_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_5000_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_6250_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_7500_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_8750_0516_2042": 1250
+  },
+  "source_nominal_counts": {
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_0_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_1250_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_2500_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_3750_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_5000_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_6250_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_7500_0516_2042": 1250,
+    "heuristic_tarware-medium-8agvs-4pickers-partialobs-v1_8750_0516_2042": 1250
+  },
+  "total_episodes": 10000,
+  "merged_at": "2026-05-16T21:48:32",
+  "global_metrics": {
+    "travel_time_mean": 58.70277567800544,
+    "travel_time_std": 24.95685202943854,
+    "travel_time_p50": 53.0,
+    "travel_time_p95": 107.0,
+    "travel_time_max": 450.0,
+    "travel_time_min": 10.0,
+    "travel_time_count": 377025,
+    "pick_rate_mean": 54.2916,
+    "clash_rate_mean": 0.085353,
+    "stuck_rate_mean": 0.005371600000000001
+  }
+}
