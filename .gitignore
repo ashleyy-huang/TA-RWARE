@@ -246,3 +246,17 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.gitignore.io/api/linux,python,windows,pycharm+all,visualstudiocode
+
+### TA-RWARE experiment artifacts ###
+
+# Local W&B cache — authoritative copy lives on W&B cloud.
+wandb/
+
+# nohup stdout from parallel heuristic workers — debug only.
+logs/
+
+# Run artifacts: ignore per-worker shards, keep only merged results.
+# Per-worker dirs: heuristic_..._<seed>_<mmdd>_<HHMM>/
+# Merged dirs:     heuristic_..._merged_<mmdd>_<HHMM>/   (tracked)
+runs/*
+!runs/heuristic_*_merged_*/
