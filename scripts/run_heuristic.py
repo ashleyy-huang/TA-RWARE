@@ -31,18 +31,35 @@ def build_episode_metrics(infos, global_episode_return, episode_returns, elapsed
     episode_length = len(infos)
     pick_rate = total_deliveries * 3600 / (5 * episode_length)
 
+    all_travel_times = [t for i in infos for t in i.get("delivery_travel_times", [])]
+    travel_time_metrics = {}
+    if all_travel_times:
+        travel_time_metrics = {
+            "travel_time_mean": float(np.mean(all_travel_times)),
+            "travel_time_std": float(np.std(all_travel_times)),
+            "travel_time_p50": float(np.percentile(all_travel_times, 50)),
+            "travel_time_p95": float(np.percentile(all_travel_times, 95)),
+            "travel_time_max": float(np.max(all_travel_times)),
+            "travel_time_min": float(np.min(all_travel_times)),
+        }
+
     return {
         # Primary metric
         "pick_rate": pick_rate,
         # Returns
         "global_return": global_episode_return,
         "episode_returns": episode_returns.tolist(),
+        "return_min": float(np.min(episode_returns)),
+        "return_max": float(np.max(episode_returns)),
+        "return_std": float(np.std(episode_returns)),
         # Delivery stats
         "total_deliveries": total_deliveries,
         "episode_length": episode_length,
         # Collision / stuck stats
         "total_clashes": total_clashes,
         "total_stuck": total_stuck,
+        "clash_rate": total_clashes / episode_length,
+        "stuck_rate": total_stuck / episode_length,
         # Efficiency stats (averaged over steps)
         "avg_agvs_distance": np.mean([i["agvs_distance_travelled"] for i in infos]),
         "avg_pickers_distance": np.mean([i["pickers_distance_travelled"] for i in infos]),
@@ -50,12 +67,27 @@ def build_episode_metrics(infos, global_episode_return, episode_returns, elapsed
         "avg_pickers_idle": np.mean([i["pickers_idle_time"] for i in infos]),
         # Speed
         "fps": episode_length / elapsed,
+        # Travel time distribution (Phase 0-C: heavy-tail profiling)
+        **travel_time_metrics,
+        # Raw per-delivery travel times — needed to recompute global percentiles
+        # across runs after merging parallel workers (per-episode summaries can't
+        # be re-aggregated correctly for non-linear stats like p95).
+        "delivery_travel_times": all_travel_times,
     }
 
 
 if __name__ == "__main__":
     config = vars(args)
     config["algo"] = "heuristic"
+
+    # Snapshot the actual env construction kwargs (grid dims, max_steps,
+    # request_queue_size, reward_type, etc.) so results stay interpretable
+    # even if registration defaults change later. env_id alone only encodes
+    # size category + agent counts; grid numerics live in tarware/__init__.py.
+    env_kwargs = dict(gym.spec(args.env_id).kwargs)
+    if hasattr(env_kwargs.get("reward_type"), "name"):
+        env_kwargs["reward_type"] = env_kwargs["reward_type"].name
+    config["env_kwargs"] = env_kwargs
 
     logger = Logger(config, log_dir=args.log_dir, use_wandb=args.wandb)
     env = gym.make(args.env_id)

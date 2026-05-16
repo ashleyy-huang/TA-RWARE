@@ -17,11 +17,24 @@ pip install -e .
 
 Key dependencies: `numpy`, `gymnasium`, `pyglet==1.5.11`, `networkx==3.2.1`, `pyastar2d` (custom fork).
 
+## Conda environment
+
+All scripts must run via the project's conda env python:
+
+- Python: `/mnt/sda/home/r147250250916/.conda/envs/tarware/bin/python`
+- When invoking from outside the TA-RWARE root, set `PYTHONPATH=/mnt/sda/home/r147250250916/research/MARL/TA-RWARE`.
+- Why: only this env has `gymnasium`, `tarware`, `pyastar2d`, etc. installed.
+
 ## Running
 
 ```bash
 # Run heuristic baseline
-python scripts/run_heuristic.py --num_episodes=10000 --seed=0 --render
+/mnt/sda/home/r147250250916/.conda/envs/tarware/bin/python \
+    scripts/run_heuristic.py --num_episodes=10000 --seed=0 --render
+
+# Merge parallel heuristic shards into a single run (+ optional W&B upload)
+/mnt/sda/home/r147250250916/.conda/envs/tarware/bin/python \
+    scripts/merge_runs.py --run_glob "runs/heuristic_*_0510_0025"
 
 # Use as a Gymnasium environment
 import gymnasium as gym

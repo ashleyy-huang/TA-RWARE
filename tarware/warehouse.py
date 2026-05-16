@@ -520,7 +520,7 @@ class Warehouse(gym.Env):
         # Return movement statistics for this step.
         return agvs_distance_travelled, pickrs_distance_travelled
 
-    
+    # TODO : Add to note
     def resolve_move_conflict(self, agent_list):
         """
         StuckCounter 追蹤每個 agent 有沒有在原地不動。
@@ -685,38 +685,84 @@ class Warehouse(gym.Env):
         return clashes
 
     def resolve_stuck_agents(self) -> None:
+        """
+        偵測「busy 但一直卡在同一個位置」的 agent。
+        如果 agent 卡太久，先嘗試重新找路；如果還是卡住，就讓它停止目前任務。
+        ---
         # This can happen when their goal is occupied after reaching their last step/re-calculating a path
-        overall_stucks = 0
+        ---
+        1. 找出需要檢查 stuck 的 busy agents
+        2. 更新每個 agent 的 stuck counter
+        3. 如果剛開始卡住，先嘗試重新 find_path()
+        4. 如果卡太久，放棄目前任務，agent.busy = False
+        """
+        
+        overall_stucks = 0 # Count how many agents are finally considered stuck in this step.
+
+        # Select agents that should be checked for being stuck.
+        # 只有 busy agents 才要被 checked -> 因為 idle agent 不會移動
+        # NOTE : 如果之後設計要讓 agent explore 的話，那應該要更改這邊的設計 -> 待討論
         moving_agents = [
             agent
             for agent in self.agents
             if agent.busy
-            and agent.req_action not in (Action.LEFT, Action.RIGHT) # Don't count changing directions
+            and agent.req_action not in (Action.LEFT, Action.RIGHT) # Turning left/right does not change position, 不算 stuck.
             and (agent.req_action!=Action.TOGGLE_LOAD or (agent.x, agent.y) in self.goals) # Don't count loading or changing directions / if at goal
         ]
+
+        # Check each moving agent's stuck counter.
         for agent in moving_agents:
-            agent_stuck_count = self.stuck_counters[agent.id - 1]
+
+            agent_stuck_count = self.stuck_counters[agent.id - 1] # Get this agent's stuck counter. agent.id starts from 1, so use id - 1 as list index.
+            
+            # Update stuck counter with the agent's current position.
+            # If the position is unchanged, the counter increases.
+            # If the position changed, the counter resets to 0.
             agent_stuck_count.update((agent.x, agent.y))
+            
+            # Case 1: stuck_counter 還在 middle range, 可接受
+            # no.1 條件式 : If the agent has stayed in the same position for more than _STUCK_THRESHOLD,
+            # no.2 條件式 : 沒有卡到真的太久, try to recover by replanning.
+            # NOTE: 這裡的 hyperparameter 大小會影響 stuck 的程度
             if _STUCK_THRESHOLD < agent_stuck_count.count < _STUCK_THRESHOLD + self.column_height + 2:  # Time to get out of aisle
+                
+                # Stop the agent for this step before trying a new path.
                 agent.req_action = Action.NOOP
+
+                # Case 1: 
+                # Agent still have path, try to find a new path (from 現在位置 to target)
                 if agent.path:
                     new_path = self.find_path((agent.y, agent.x), (agent.path[-1][1], agent.path[-1][0]), agent)
+                    
+                    
+                    # If a new path is found, replace the old path.
                     # Picker should wait for AGV to arrive at destination regardless of stuck count
                     if new_path:
                         agent.path = new_path
-                        if len(agent.path) == 1:
-                            continue
-                        agent_stuck_count.reset((agent.x, agent.y))
+                        if len(agent.path) == 1: # 如果只剩下 1 step -> very close to the target -> 有可能只是在等協作條件成立 -> skip resetting the stuck_counter and just wait
+                            # 可能是 picker 已到但 AGV 還沒抵達，所以 picker 這輪會先被設為 NOOP
+                            # 但 picler 並不是永遠等待，要在上面 if 的 stuck count 處在 middle range 時才繼續等
+                            continue 
+                        agent_stuck_count.reset((agent.x, agent.y)) # multiple step left(get useful path) -> reset stuck_counter from the current position.
                         continue
+                
+                # Case 2:
+                # Agent has no path, it cannot recover by replanning.
+                # Mark it as stuck and stop its current task. -> 只是使 AGV 變成 idle，之後他還是可以被重新指派新的 macro action
                 else:
                     overall_stucks += 1
                     agent.busy = False
                     agent_stuck_count.reset()
+            
+            # Case 2: Agent Stuck_counter 卡太久了
+            # give up current task, and make it idle
             if agent_stuck_count.count > _STUCK_THRESHOLD + self.column_height + 2:  # Time to get out of aisle
                 overall_stucks += 1
-                agent_stuck_count.reset((agent.x, agent.y))
+                agent_stuck_count.reset((agent.x, agent.y)) 
                 agent.req_action = Action.NOOP
                 agent.busy = False
+
+        # Return how many agents were considered stuck in this step.
         return overall_stucks
 
     def _execute_forward(self, agent: Agent) -> None:
@@ -778,6 +824,12 @@ class Warehouse(gym.Env):
         return rewards
 
     def execute_micro_actions(self, rewards: np.ndarray[int]) -> np.ndarray[int]:
+        """
+        FORWARD: 移動一格
+        LEFT/RIGHT: 轉向
+        TOGGLE_LOAD: pickup 或 unload
+        """
+        
         for agent in self.agents:
             if agent.req_action == Action.FORWARD:
                 self._execute_forward(agent)
@@ -791,34 +843,79 @@ class Warehouse(gym.Env):
         return rewards
 
     def process_shelf_deliveries(self, rewards: np.ndarray[int]) -> np.ndarray[int]:
-        shelf_deliveries = 0
-        delivery_travel_times = []
+        """
+        檢查有沒有 AGV 把「被 request 的 shelf」送到 goal
+        如果有，就給 reward、更新 request queue、記錄 delivery time，並重設 inactive counter。
+        """
+        shelf_deliveries = 0 # 在這個 step 有幾個 shelf delivered
+        delivery_travel_times = [] # Store travel times for shelves delivered in this step.
+
+        # Check every goal / delivery location.
+        # Note: lf.goals stores coordinates as (x, y),
+        # but this loop names them as (y, x), so the later grid indexing looks swapped.
         for y, x in self.goals:
+
+            # Check whether there is a carried shelf at this goal location.
+            # self.grid uses [layer, row, col] = [layer, y, x],
+            # so here it uses [x, y] because the loop variable names are swapped.
             shelf_id = self.grid[CollisionLayers.CARRIED_SHELVES, x, y]
+
+            # 條件式 1: no carried shelf here, skip
+            # 條件式 2: shelf is not requested, not counted as delivery
             if not shelf_id  or self.shelfs[shelf_id - 1] not in self.request_queue:
                 continue
+            
+            # Delivered shelf is requested
             # Remove shelf from request queue and add replacement
             carried_shels = [agent.carrying_shelf for agent in self.agents if agent.carrying_shelf]
-            new_shelf_candidates = list(set(self.shelfs) - set(self.request_queue) - set(carried_shels)) # sort so np.random with seed is repeatable
-            new_shelf_candidates.sort(key = lambda x: x.id)
-            new_request = np.random.choice(new_shelf_candidates)
-            self.request_queue[self.request_queue.index(self.shelfs[shelf_id - 1])] = new_request
 
+            # New request candidates are shelves that are:
+            # 1. not already requested
+            # 2. not currently being carried
+            new_shelf_candidates = list(set(self.shelfs) - set(self.request_queue) - set(carried_shels))
+            
+            new_shelf_candidates.sort(key = lambda x: x.id) # Sort candidates so random choice is reproducible when using a fixed seed.
+
+            new_request = np.random.choice(new_shelf_candidates) # Choose a new shelf request.
+            
+            self.request_queue[self.request_queue.index(self.shelfs[shelf_id - 1])] = new_request # Replace the delivered shelf in the request queue with the new request.
+
+
+            """ 紀錄把 shelf 送達的 agent id 要給 reward """
+            # Find the AGV currently at the goal location.
+            # Grid stores agent ids, and agent ids start from 1,
+            # so subtract 1 to index self.agents
             agent = self.agents[self.grid[CollisionLayers.AGVS, x, y] - 1]
+
+            # NOTE: Delivery Reward Design 
+            # Avoid giving reward repeatedly while the AGV remains on the goal. -> 怕 agent 一直站在原地，使得env 以為他一直重複送達
             if not agent.has_delivered:
                 agent.has_delivered = True
                 if self.reward_type == RewardType.GLOBAL:
                     rewards += 1
                 elif self.reward_type == RewardType.INDIVIDUAL:
                     rewards[agent.id - 1] += 1
+                
+                # 紀錄 how many environment steps the AGV took to finish a delivery.
+                # task_start_step is set at the *start* of the step where the macro
+                # action was assigned (before _cur_steps is incremented at end-of-step).
+                # Delivery is also detected before that increment, so the raw difference
+                # counts step *boundaries* — off by 1 vs the inclusive step count.
+                # +1 corrects it: an AGV that delivers in the same step as assignment
+                # consumed 1 environment step, not 0.
                 if agent.task_start_step is not None:
-                    delivery_travel_times.append(self._cur_steps - agent.task_start_step)
+                    delivery_travel_times.append(
+                        self._cur_steps - agent.task_start_step + 1
+                    )
                     agent.task_start_step = None
+            
+            # INDICATOR: 紀錄有幾個 shelf 了
             shelf_deliveries += 1
 
+        # INDICATOR: 紀錄已經連續幾個 step 沒有成功 delivery
         if shelf_deliveries:
             self._cur_inactive_steps = 0
-        else:
+        else: # If no shelf was delivered, increase inactivity counter.
             self._cur_inactive_steps += 1
 
         return rewards, shelf_deliveries, delivery_travel_times
@@ -873,12 +970,36 @@ class Warehouse(gym.Env):
     def step(
         self, macro_actions: List[int]
     ) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], Dict]:
+        """
+        Execute one environment step.
+
+        macro_actions 是 policy 給 environment 的高階動作。
+        每個 macro action 代表一個 agent 的目標位置 ID，
+        不是直接的 LEFT / RIGHT / FORWARD 這種低階移動指令。
+
+        這個 function 會完成一次 environment step：
+        1. 把 macro action 轉成 micro action
+        2. 處理碰撞
+        3. 處理卡住的 agent
+        4. 執行移動 / 轉向 / 搬貨
+        5. 計算 reward
+        6. 回傳新的 observation、reward、done flags 和 info
+        """
+
         # Attribute macro actions to agents and resolve conflicts
+        # 把每個 agent 的 macro action 轉成實際要執行的 micro action -> 只設定 agent.req_action，不會真的移動 agent
         agvs_distance_travelled, pickers_distance_travelled = self.attribute_macro_actions(macro_actions)
+
+        # 在真正執行動作前，先檢查 agent 之間會不會發生 clashes
+        # 如果某些 agent 會撞在一起， resolve_move_conflict 會把 req_action 改成 NOOP，或是重新規劃 path
         clashes_count = self.resolve_move_conflict(self.agents)
-        # Restart agents if they are stuck at the same position
+
+        # 檢查 busy agent 是否卡在同一個位置太久。
+        # 如果 agent 卡住，這裡可能會重新規劃 path，取消目前任務，讓 agent 變回 idle
         stucks_count = self.resolve_stuck_agents()
 
+        # NOTE: Reward Array 設計
+        # Initialized Reward Array，every agent 一個 reward -> 初始都是 0
         rewards = np.zeros(self.num_agents)
         # Apply penalty for inactivity
         rewards -= 0.001
@@ -887,8 +1008,12 @@ class Warehouse(gym.Env):
         # Process shelf deliveries
         rewards, shelf_deliveries, delivery_travel_times = self.process_shelf_deliveries(rewards)
 
-        self._recalc_grid()
-        self._cur_steps += 1
+        self._recalc_grid() # 重新計算 warehouse grid 每層的狀態
+        self._cur_steps += 1 # environment step counter 加 1。
+        
+        # 判斷 episode 是否結束，條件有兩種:
+        # 1. 太久沒有成功 delivery
+        # 2. 已經達到最大 step 數
         if (
             self.max_inactivity_steps
             and self._cur_inactive_steps >= self.max_inactivity_steps
@@ -897,8 +1022,12 @@ class Warehouse(gym.Env):
         else:
             terminateds = truncateds =  self.num_agents * [False]
 
+        # 先更新 observation mapper 裡的環境資訊，再依照每個 agent 產生新的 observation。
         self.observation_space_mapper.extract_environment_info(self)
         new_obs = tuple([self.observation_space_mapper.observation(agent) for agent in self.agents])
+
+        # 把這個 step 的資訊整理成 info dictionary
+        # 這些資料通常用來 logging、debug 或分析訓練結果
         info = self._build_info(
             agvs_distance_travelled,
             pickers_distance_travelled,
@@ -907,6 +1036,9 @@ class Warehouse(gym.Env):
             shelf_deliveries,
             delivery_travel_times,
         )
+
+        # 回傳 Gymnasium step 格式：
+        # observation, reward, terminated, truncated, info
         return new_obs, list(rewards), terminateds, terminateds, info
 
     def _build_info(
