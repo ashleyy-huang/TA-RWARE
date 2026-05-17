@@ -1,0 +1,19 @@
+algo: iac
+env_id: tarware-tiny-2agvs-1pickers-partialobs-v1
+num_episodes: 10000
+seed: 0
+log_dir: runs/iac
+wandb:
+  enabled: true
+  project: marl-iac
+hp:
+  lr: 3.0e-4
+  adam_eps: 1.0e-3
+  gamma: 0.99
+  gae_lambda: 0.96
+  n_step: 5
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+picker_mode: heuristic
+device: cpu

@@ -1,0 +1,12 @@
+algo: heuristic
+env_id: tarware-medium-8agvs-4pickers-partialobs-v1
+num_episodes: 10000
+seed: 0
+log_dir: runs/baseline_heuristic
+wandb:
+  enabled: true
+  project: tarware
+notes: |
+  Canonical heuristic baseline config. Not consumed programmatically yet;
+  run_heuristic.py still uses CLI flags. Recorded here as the
+  authoritative settings for `runs/baseline_heuristic/heuristic_..._merged_0516_2148`.

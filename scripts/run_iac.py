@@ -10,6 +10,8 @@ from algos.iac.hp import IACHyperParams as HyperParams
 from algos.iac.trainer import IACTrainer
 from tarware.utils.logger import Logger
 
+# DEPRECATED: prefer `scripts/train.py --config configs/iac_*.yaml`.
+# Will be removed in R3. Kept temporarily so existing dev runs keep working.
 parser = ArgumentParser(
     description="Train IAC agents on TA-RWARE",
     formatter_class=ArgumentDefaultsHelpFormatter,
