@@ -36,6 +36,11 @@ All scripts must run via the project's conda env python:
 /mnt/sda/home/r147250250916/.conda/envs/tarware/bin/python \
     scripts/merge_runs.py --run_glob "runs/heuristic_*_0510_0025"
 
+# Train IAC via YAML config (primary entry point for RL training)
+PYTHONPATH=$PWD /mnt/sda/.../python scripts/train.py --config configs/iac_tiny.yaml
+PYTHONPATH=$PWD /mnt/sda/.../python scripts/train.py --config configs/iac_medium.yaml \
+    --num_episodes 50 --seed 0   # CLI overrides for sanity runs
+
 # Use as a Gymnasium environment
 import gymnasium as gym
 env = gym.make("tarware-tiny-3agvs-2pickers-partialobs-v1")
@@ -92,3 +97,35 @@ Four collision layers (`CollisionLayers`): AGVs, Pickers, Shelves, Carried Shelv
 ### Environment Registration
 
 [tarware/\_\_init\_\_.py](tarware/__init__.py) registers all variant combinations with Gymnasium at import time. To add a new size variant, define its parameters in the `SIZE_PARAMS` dict there and add a corresponding registration call.
+
+### Algos package (algos/)
+
+Algorithm code lives in a separate top-level package per algo to keep
+baseline-vs-algo comparisons clean:
+
+- `algos/base/` — algo-agnostic: `networks.py` (Actor/Critic MLPs),
+  `rollout.py` (`NStepRollout`, γ^k GAE), `trainer_base.py`
+  (`TrainerBase` with SMDP-loop helpers), `registry.py`
+  (`ALGO_REGISTRY` name→class).
+- `algos/policies/picker_heuristic.py` — non-learning controllers.
+- `algos/iac/` — IAC AGV-only baseline (`agent.py`, `trainer.py`, `hp.py`).
+- Future algos: each gets its own `algos/<name>/` and lives on its
+  own branch.
+
+YAML configs in `configs/` drive training via `scripts/train.py`.
+Output trees are separated under `runs/{algo}/`.
+
+## Baseline isolation invariants
+
+These files form the heuristic baseline and the env contract. ANY change
+to them invalidates published comparisons. They are FROZEN: no algo branch
+may modify them.
+
+- `tarware/warehouse.py`, `tarware/heuristic.py`, `tarware/spaces/`,
+  `tarware/definitions.py`, `tarware/rendering.py`, `tarware/utils/`,
+  `tarware/__init__.py`
+- `scripts/run_heuristic.py`, `scripts/merge_runs.py`
+- `runs/baseline_heuristic/heuristic_*_merged_*/` (canonical baseline data)
+
+The regression guard `tests/baseline/test_heuristic_regression.py` pins
+the heuristic seed=0 medium-env numerics. CI must run it on every PR.

@@ -259,4 +259,6 @@ logs/
 # Per-worker dirs: heuristic_..._<seed>_<mmdd>_<HHMM>/
 # Merged dirs:     heuristic_..._merged_<mmdd>_<HHMM>/   (tracked)
 runs/*
-!runs/heuristic_*_merged_*/
+!runs/baseline_heuristic/
+runs/baseline_heuristic/*
+!runs/baseline_heuristic/heuristic_*_merged_*/
