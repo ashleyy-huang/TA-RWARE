@@ -4,6 +4,79 @@
 
 ---
 
+## 2026-05-17 (Phase 1 IAC)
+
+### [12] `tarware/algos/` — Phase 1: IAC non-hierarchical baseline
+
+**對應 Plan**: Phase 1 — IAC Training Indicators (episode_return, pick_rate, clash_rate, policy_entropy, mask_behavior, utilization)
+
+---
+
+#### `tarware/algos/ac_nets.py` (45 lines)
+
+獨立的 `Actor` / `Critic` MLP，各自 2×FC(64)+ReLU + 輸出層，orthogonal init（hidden: sqrt(2)、policy head: 0.01、value head: 1.0）。`Actor.forward()` 回傳 raw logits；`Critic.forward()` 回傳 scalar（`squeeze(-1)`）。
+
+---
+
+#### `tarware/algos/rollout.py` (74 lines)
+
+`Transition` dataclass + `NStepRollout`。`compute_gae()` 實作標準 GAE backward pass，支援 bootstrap value 與 done-mask 遮蔽。通過 `tests/test_rollout.py` 3 個數值測試（包含 done boundary）。
+
+---
+
+#### `tarware/algos/picker_policy.py` (116 lines)
+
+**關鍵元件**。`PickerHeuristicPolicy` 複製 `heuristic.py` 的 picker 分配邏輯，讓 AGV RL policy 能搭配確定性 picker baseline。
+
+實作難點：
+1. **狀態持久化**：heuristic 每 step 掃描整個 `assigned_agvs` dict（包含 busy 中的 AGV），而非只看當步 action。使用 `agv.target` 推斷進行中的任務，不只看傳入的 action。
+2. **執行順序**：heuristic 是先 assign pickers（lines 117-124）、再 pop 已到達的 pickers（lines 125-129），才建立 actions。若順序反過來，picker 在「已抵達、同步被 assign、同步被 pop」的邊界 case 會輸出錯誤 action（step 15 bug）。
+
+通過 `tests/test_picker_policy.py` parity test：5 個 seed × 500 steps 完全吻合 heuristic_episode 輸出。
+
+---
+
+#### `tarware/algos/iac.py` (136 lines)
+
+`HyperParams` dataclass + `IACAgent`。`act()` 對 logits 做 masked_fill（-1e9）再 sample，返回 (action, log_prob, value, entropy)。`update()` 標準化 advantage、計算 policy loss + value loss、clip grad norm、clear buffer。
+
+---
+
+#### `tarware/algos/trainer.py` (186 lines)
+
+`IACTrainer` 封裝完整訓練 loop。關鍵細節：使用 `env.unwrapped` 存取 warehouse 內部狀態（`agents`, `compute_valid_action_masks()`, `num_agvs`, `num_pickers`）；env.reset() 回傳 obs tuple（非 gymnasium 標準的 (obs, info)）。n-step update 在 `rollout_step >= n_step or done` 時觸發，bootstrap 在 episode 結束時為 0.0。checkpoint 每 500 ep 存一次（從 ep 1000 開始）。
+
+---
+
+#### `scripts/run_iac.py` (74 lines)
+
+Mirror `run_heuristic.py` 架構，支援所有 hyperparameter CLI flags，W&B logging，checkpoint_dir 自動建立。
+
+---
+
+#### `tests/` (3 files, 366 lines)
+
+| 檔案 | 測試 | 結果 |
+|------|------|------|
+| `test_rollout.py` | GAE 數值正確性（3 cases）| PASS |
+| `test_picker_policy.py` | 5 seed × full episode parity | PASS |
+| `test_iac_smoke.py` | 10 episodes no-crash + schema check | PASS |
+
+全部 5 tests PASS (`pytest tests/ -v`)。
+
+---
+
+#### Sanity run
+
+```
+env: tarware-tiny-2agvs-1pickers-partialobs-v1
+episodes: 1500, seed=0
+```
+
+Pick rate trend（待 run 完成後補填）：ep 0 ≈ 1.44, ep 500, ep 1000, ep 1500 見 `logs/iac_tiny_sanity.log`。
+
+---
+
 ## 2026-05-16
 
 當天工作分三個時段：
