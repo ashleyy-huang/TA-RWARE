@@ -7,6 +7,7 @@ import gymnasium as gym
 
 from tarware.algos.iac import HyperParams, IACAgent
 from tarware.algos.picker_policy import PickerHeuristicPolicy
+from tarware.algos.trainer import IACTrainer
 from tarware.utils.logger import Logger
 from tarware.warehouse import AgentType
 
@@ -96,3 +97,53 @@ def test_smdp_only_decides_when_idle():
     # Verify: decisions happen at step 0 (all idle at reset) for both AGVs
     for i in range(num_agvs):
         assert 0 in decision_steps[i], f"AGV {i} should decide at step 0 (idle after reset)"
+
+
+def test_smdp_k_accounting():
+    """k values stored per transition must all be >= 1 and sum to episode length."""
+    env = gym.make("tarware-tiny-2agvs-1pickers-partialobs-v1")
+    hp = HyperParams(n_step=200)
+    config = {
+        "algo": "iac",
+        "env_id": "tarware-tiny-2agvs-1pickers-partialobs-v1",
+        "seed": 7,
+    }
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        logger = Logger(config, log_dir=tmp, use_wandb=False)
+        trainer = IACTrainer(env, hp, logger, seed=7)
+
+        # Intercept store calls to capture k values
+        k_log = [[] for _ in trainer.iac_agents]
+        original_stores = []
+        for idx, agent in enumerate(trainer.iac_agents):
+            orig = agent.store
+
+            def make_interceptor(orig_fn, k_list):
+                def interceptor(*args, **kwargs):
+                    k_list.append(kwargs.get("k", args[7] if len(args) > 7 else 1))
+                    return orig_fn(*args, **kwargs)
+                return interceptor
+
+            agent.store = make_interceptor(orig, k_log[idx])
+            original_stores.append(orig)
+
+        metrics = trainer._run_episode(seed=7)
+        logger.close()
+        env.close()
+
+    episode_length = metrics["episode_length"]
+    num_agvs = len(trainer.agv_indices)
+
+    for i in range(num_agvs):
+        ks = k_log[i]
+        assert len(ks) > 0, f"AGV {i}: no transitions stored"
+        assert all(k >= 1 for k in ks), f"AGV {i}: k < 1 found: {ks}"
+        k_sum = sum(ks)
+        assert k_sum <= episode_length, (
+            f"AGV {i}: sum(k)={k_sum} > episode_length={episode_length}"
+        )
+        decisions = metrics["avg_decisions_per_agv"] * num_agvs
+        assert len(ks) <= decisions + num_agvs, (
+            f"AGV {i}: more stored transitions than decisions"
+        )

@@ -28,7 +28,7 @@ def test_gae_correctness():
     rollout = NStepRollout(n_step=3)
     for r, v in seq:
         obs, act, lp, val, ent, rw, dn = _make_dummy_transition(r, v, False)
-        rollout.add(obs, act, lp, val, ent, rw, dn)
+        rollout.add(obs, act, lp, val, ent, rw, dn, k=1)
 
     adv, ret = rollout.compute_gae(bootstrap, gamma, lam)
 
@@ -65,9 +65,9 @@ def test_gae_episode_boundary():
 
     rollout = NStepRollout(n_step=2)
     # t=0: reward=1.0, value=0.5, done=False
-    rollout.add(*_make_dummy_transition(1.0, 0.5, False))
+    rollout.add(*_make_dummy_transition(1.0, 0.5, False), k=1)
     # t=1: reward=2.0, value=0.8, done=True
-    rollout.add(*_make_dummy_transition(2.0, 0.8, True))
+    rollout.add(*_make_dummy_transition(2.0, 0.8, True), k=1)
 
     adv, ret = rollout.compute_gae(bootstrap, gamma, lam)
 
@@ -88,7 +88,43 @@ def test_gae_episode_boundary():
 
 def test_clear():
     rollout = NStepRollout(n_step=5)
-    rollout.add(*_make_dummy_transition(1.0, 0.5, False))
+    rollout.add(*_make_dummy_transition(1.0, 0.5, False), k=1)
     assert len(rollout) == 1
     rollout.clear()
     assert len(rollout) == 0
+
+
+def test_gae_smdp_discount():
+    """SMDP discount: each transition has variable option duration k.
+
+    Verify gamma^k is applied correctly in bootstrap and GAE recursion.
+    """
+    rollout = NStepRollout(n_step=10)
+    gamma = 0.99
+    lam = 0.96
+
+    transitions_spec = [
+        (1.0, 0.5, 1),
+        (0.5, 0.3, 3),
+        (2.0, 0.8, 2),
+    ]
+    for r, v, k in transitions_spec:
+        rollout.add(
+            obs=torch.zeros(1), action=torch.tensor(0),
+            log_prob=torch.tensor(0.0), value=torch.tensor(v),
+            entropy=torch.tensor(0.0), reward=r, done=False, k=k,
+        )
+
+    bootstrap = 0.4
+    advantages, returns = rollout.compute_gae(bootstrap, gamma, lam)
+
+    expected_gae_2 = 2.0 + (gamma ** 2) * 0.4 - 0.8
+    expected_gae_1 = (0.5 + (gamma ** 3) * 0.8 - 0.3) + (gamma ** 3) * lam * expected_gae_2
+    expected_gae_0 = (1.0 + gamma * 0.3 - 0.5) + gamma * lam * expected_gae_1
+
+    assert torch.allclose(advantages[2], torch.tensor(expected_gae_2), atol=1e-5)
+    assert torch.allclose(advantages[1], torch.tensor(expected_gae_1), atol=1e-5)
+    assert torch.allclose(advantages[0], torch.tensor(expected_gae_0), atol=1e-5)
+
+    expected_returns = advantages + torch.tensor([0.5, 0.3, 0.8])
+    assert torch.allclose(returns, expected_returns, atol=1e-5)

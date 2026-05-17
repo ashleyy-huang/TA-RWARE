@@ -13,6 +13,7 @@ class Transition:
     entropy: torch.Tensor
     reward: float
     done: bool
+    k: int = 1
 
 
 class NStepRollout:
@@ -31,9 +32,10 @@ class NStepRollout:
         entropy: torch.Tensor,
         reward: float,
         done: bool,
+        k: int,
     ) -> None:
         self.transitions.append(
-            Transition(obs, action, log_prob, value, entropy, reward, done)
+            Transition(obs, action, log_prob, value, entropy, reward, done, k)
         )
 
     def compute_gae(
@@ -57,9 +59,10 @@ class NStepRollout:
         next_value = bootstrap_value
         for t in reversed(range(n)):
             tr = self.transitions[t]
-            mask = 1.0 - float(tr.done)
-            delta = tr.reward + gamma * next_value * mask - tr.value.item()
-            gae = delta + gamma * lam * gae * mask
+            mask_done = 1.0 - float(tr.done)
+            discount = gamma ** tr.k
+            delta = tr.reward + discount * next_value * mask_done - tr.value.item()
+            gae = delta + discount * lam * gae * mask_done
             advantages[t] = gae
             next_value = tr.value.item()
 

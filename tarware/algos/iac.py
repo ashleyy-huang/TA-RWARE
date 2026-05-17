@@ -61,7 +61,9 @@ class IACAgent:
 
         value = self.critic(obs_t)
 
-        return int(action.item()), log_prob.squeeze(0), value.squeeze(0), entropy.squeeze(0)
+        return (
+            int(action.item()), log_prob.squeeze(0), value.squeeze(0), entropy.squeeze(0)
+        )
 
     def store(
         self,
@@ -72,10 +74,11 @@ class IACAgent:
         entropy: torch.Tensor,
         reward: float,
         done: bool,
+        k: int,
     ) -> None:
         obs_t = torch.tensor(obs, dtype=torch.float32)
         action_t = torch.tensor(action)
-        self.buffer.add(obs_t, action_t, log_prob, value, entropy, reward, done)
+        self.buffer.add(obs_t, action_t, log_prob, value, entropy, reward, done, k)
 
     def update(self, bootstrap_value: float) -> dict:
         """Compute GAE, run one gradient step, clear buffer.

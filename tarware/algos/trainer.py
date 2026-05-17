@@ -61,14 +61,90 @@ class IACTrainer:
                 f"Bsy: {ep_metrics['agv_busy_ratio']:.2f}"
             )
 
+    def _compute_agv_mask(self, agv) -> np.ndarray:
+        """Three-state mask for a single AGV.
+
+        Not carrying → requested shelves only;
+        carrying + shelf is requested → goals only;
+        carrying + shelf not requested (delivered) → empty slots only.
+        NOOP (action 0) kept valid to preserve env convention.
+        """
+        env = self._warehouse
+        n_goals = len(env.goals)
+        mask = np.zeros(env.action_size, dtype=np.float32)
+        mask[0] = 1.0
+
+        if agv.carrying_shelf is None:
+            mask[1 + n_goals:] = env.get_shelf_request_information()
+        elif agv.carrying_shelf in env.request_queue:
+            mask[1: 1 + n_goals] = 1.0
+        else:
+            mask[1 + n_goals:] = env.get_empty_shelf_information()
+
+        return mask
+
+    def _finalize_smdp(self, i, agent, smdp, env_step_counter, done):
+        """Store the completed option for AGV i and reset accumulated reward."""
+        obs_p, act_p, lp_p, val_p, ent_p = smdp[i]["pending"]
+        k_opt = env_step_counter - smdp[i]["option_start_step"]
+        agent.store(
+            obs_p, act_p, lp_p, val_p, ent_p,
+            smdp[i]["accumulated_reward"], done,
+            k=max(k_opt, 1),
+        )
+        smdp[i]["accumulated_reward"] = 0.0
+
+    def _decide_agv_action(self, i, agent, smdp, obs_tuple, env_step_counter):
+        """Make a new decision for idle AGV i; return selected action."""
+        wh_agent = self._warehouse.agents[self.agv_indices[i]]
+        obs_i = obs_tuple[self.agv_indices[i]]
+        mask_i = self._compute_agv_mask(wh_agent)
+        action, log_prob, value, entropy = agent.act(obs_i, mask_i)
+        smdp[i]["pending"] = (obs_i, action, log_prob, value, entropy)
+        smdp[i]["option_start_step"] = env_step_counter
+        smdp[i]["decisions"] += 1
+        return action
+
+    def _collect_agv_actions(self, smdp, obs_tuple, env_step_counter):
+        """Return per-AGV actions; finalize/start options for idle AGVs."""
+        agv_actions = []
+        for i, agent in enumerate(self.iac_agents):
+            wh_agent = self._warehouse.agents[self.agv_indices[i]]
+            if not wh_agent.busy:
+                if smdp[i]["pending"] is not None:
+                    self._finalize_smdp(i, agent, smdp, env_step_counter, False)
+                act = self._decide_agv_action(
+                    i, agent, smdp, obs_tuple, env_step_counter
+                )
+                agv_actions.append(act)
+            else:
+                agv_actions.append(0)
+        return agv_actions
+
+    def _episode_end_update(self, smdp, env_step_counter, total_losses):
+        """Finalize pending options, run gradient updates, populate total_losses."""
+        for i, agent in enumerate(self.iac_agents):
+            if smdp[i]["pending"] is not None:
+                self._finalize_smdp(i, agent, smdp, env_step_counter, True)
+                smdp[i]["pending"] = None
+        for i, agent in enumerate(self.iac_agents):
+            if len(agent.buffer) > 0:
+                losses = agent.update(bootstrap_value=0.0)
+                for k, v in losses.items():
+                    total_losses[k].append(v)
+
     def _run_episode(self, seed: int) -> dict:
         obs_tuple = self.env.reset(seed=seed)
         self.picker_policy.reset()
 
         num_agvs = len(self.agv_indices)
-        # Per-AGV SMDP state: pending decision and accumulated reward
         smdp = [
-            {"pending": None, "accumulated_reward": 0.0, "decisions": 0}
+            {
+                "pending": None,
+                "accumulated_reward": 0.0,
+                "decisions": 0,
+                "option_start_step": 0,
+            }
             for _ in range(num_agvs)
         ]
 
@@ -77,72 +153,31 @@ class IACTrainer:
         all_infos = []
         total_losses = defaultdict(list)
 
-        # Mask aggregation accumulators (Bug 3 fix)
         mask_valid_count_sum = np.zeros(num_agvs)
         mask_step_count = 0
+        env_step_counter = 0
 
         while not done:
-            masks = self._warehouse.compute_valid_action_masks()
-
-            # Accumulate mask stats every step (for comparable metric across runs)
             for i in range(num_agvs):
-                mask_valid_count_sum[i] += float(masks[self.agv_indices[i]].sum())
+                agv = self._warehouse.agents[self.agv_indices[i]]
+                mask_valid_count_sum[i] += float(self._compute_agv_mask(agv).sum())
             mask_step_count += 1
 
-            agv_actions = []
-            for i, agent in enumerate(self.iac_agents):
-                wh_agent = self._warehouse.agents[self.agv_indices[i]]
-                if not wh_agent.busy:
-                    # Finalize previous pending decision if any
-                    if smdp[i]["pending"] is not None:
-                        obs_p, act_p, lp_p, val_p, ent_p = smdp[i]["pending"]
-                        agent.store(
-                            obs_p, act_p, lp_p, val_p, ent_p,
-                            smdp[i]["accumulated_reward"], False,
-                        )
-                        smdp[i]["accumulated_reward"] = 0.0
-
-                    # Make a new decision
-                    obs_i = obs_tuple[self.agv_indices[i]]
-                    mask_i = masks[self.agv_indices[i]]
-                    action, log_prob, value, entropy = agent.act(obs_i, mask_i)
-                    smdp[i]["pending"] = (obs_i, action, log_prob, value, entropy)
-                    smdp[i]["decisions"] += 1
-                    agv_actions.append(action)
-                else:
-                    # AGV busy: submit NOOP, do not call policy
-                    agv_actions.append(0)
-
+            agv_actions = self._collect_agv_actions(smdp, obs_tuple, env_step_counter)
             picker_actions = self.picker_policy.act(agv_actions)
             full_actions = [int(a) for a in agv_actions] + picker_actions
 
             obs_tuple, rewards, terms, truncs, info = self.env.step(full_actions)
             done = all(terms) or all(truncs)
+            env_step_counter += 1
 
             episode_returns += np.array(rewards, dtype=np.float64)
             all_infos.append(info)
 
-            # Accumulate per-AGV rewards into SMDP state
             for i in range(num_agvs):
                 smdp[i]["accumulated_reward"] += float(rewards[self.agv_indices[i]])
 
-        # Finalize all pending decisions at episode end with done=True
-        for i, agent in enumerate(self.iac_agents):
-            if smdp[i]["pending"] is not None:
-                obs_p, act_p, lp_p, val_p, ent_p = smdp[i]["pending"]
-                agent.store(
-                    obs_p, act_p, lp_p, val_p, ent_p,
-                    smdp[i]["accumulated_reward"], True,
-                )
-                smdp[i]["pending"] = None
-                smdp[i]["accumulated_reward"] = 0.0
-
-        # Episode-end update for each AGV
-        for i, agent in enumerate(self.iac_agents):
-            if len(agent.buffer) > 0:
-                losses = agent.update(bootstrap_value=0.0)
-                for k, v in losses.items():
-                    total_losses[k].append(v)
+        self._episode_end_update(smdp, env_step_counter, total_losses)
 
         avg_decisions = float(np.mean([s["decisions"] for s in smdp]))
         mask_valid_counts = (mask_valid_count_sum / max(mask_step_count, 1)).tolist()
@@ -162,7 +197,9 @@ class IACTrainer:
         episode_length = len(all_infos)
         pick_rate = total_deliveries * 3600 / (5 * episode_length)
 
-        all_travel_times = [t for i in all_infos for t in i.get("delivery_travel_times", [])]
+        all_travel_times = [
+            t for i in all_infos for t in i.get("delivery_travel_times", [])
+        ]
         travel_time_metrics = {}
         if all_travel_times:
             travel_time_metrics = {

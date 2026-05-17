@@ -208,6 +208,96 @@ All Stage 2 criteria passed. Picker now functional; AGV learning unblocked.
 
 ---
 
+## 2026-05-17 (Phase 1 IAC — Iteration 2 correctness fixes)
+
+### [19] Iteration 2: three-state AGV mask + SMDP γ^k discount
+
+**Two bugs fixed; no changes to warehouse.py, picker_policy.py, or scripts.**
+
+---
+
+**Fix A — Three-state AGV action mask**
+
+*Problem*: `warehouse.compute_valid_action_masks()` was too permissive for AGVs:
+- NOT carrying → requested shelves ✓ (correct)
+- Carrying → both goals AND return slots were valid
+
+A carrying AGV that had a *requested* shelf could pick "return slot" as its action, skipping delivery and the +1 reward. This diverged from the heuristic state machine semantics.
+
+*Three-state semantics*:
+1. NOT carrying → requested shelves only
+2. Carrying + shelf in `request_queue` (not yet delivered) → goals only
+3. Carrying + shelf NOT in `request_queue` (already delivered) → empty slots only
+
+Detection of (2) vs (3): `agv.carrying_shelf in env.request_queue`. `process_shelf_deliveries` (warehouse.py:881) replaces the delivered shelf in `request_queue` with a new request, so after delivery the shelf is no longer in the queue — the check naturally distinguishes pre/post delivery.
+
+*Implementation*: new `_compute_agv_mask(agv)` method in `IACTrainer` (trainer.py). The env's wide mask is only used for pickers; all AGV policy calls and mask metrics now use the three-state mask. `mask_avg_valid_count_agv` also uses the new mask (accumulates at every step for all AGVs, regardless of busy state).
+
+---
+
+**Fix B — SMDP γ^k bootstrap discount**
+
+*Problem*: `compute_gae` used single-step `gamma` discount, but each SMDP transition covers k environment steps. The correct bootstrap discount is γ^k, and the GAE recursion discount must also be γ^k for internal consistency.
+
+*Hybrid formula*:
+- Reward R = undiscounted sum over option (unchanged — matches paper Manager formula)
+- Bootstrap: `δ_t = R_t + γ^k * V(s') * mask - V(s_t)`
+- GAE: `A_t = δ_t + γ^k * λ * A_{t+1} * mask`
+
+*Code paths touched*:
+- `tarware/algos/rollout.py`: added `k: int` field to `Transition`; `NStepRollout.add()` now requires `k`; `compute_gae` uses `gamma ** tr.k` for both bootstrap and recursion.
+- `tarware/algos/iac.py`: `IACAgent.store()` now requires `k: int` and passes it through to `buffer.add()`.
+- `tarware/algos/trainer.py`: added `option_start_step` to per-AGV SMDP state dict; `env_step_counter` tracks env steps (increments after each `env.step()`); k is computed as `env_step_counter - option_start_step` when finalizing a transition (both mid-episode and episode-end); `max(k_opt, 1)` guard prevents k=0 on edge cases.
+
+*Off-by-one accounting*:
+- Decision sampled → `option_start_step = env_step_counter` (before env.step)
+- `env.step()` called → `env_step_counter += 1`
+- AGV next idle (or done) → `k = env_step_counter - option_start_step`
+
+This means k = number of env.step() calls during the option, which equals option duration in env steps. k >= 1 guaranteed by `max(..., 1)`.
+
+---
+
+**Tests added**:
+
+- `tests/test_rollout.py::test_gae_smdp_discount`: three transitions with k=[1,3,2], bootstrap=0.4, hand-computed expected advantages and returns verified to atol=1e-5. Existing tests updated to pass `k=1` explicitly (required positional arg).
+- `tests/test_smdp_decision.py::test_smdp_k_accounting`: instruments trainer.store via closure to capture k values for one episode, then asserts all k >= 1 and sum(k) <= episode_length per AGV.
+
+---
+
+**Stage 1 verification**: `pytest tests/ -v` — 9/9 PASS.
+
+| Test | Result |
+|------|--------|
+| test_iac_smoke.py::test_iac_10_episodes_no_crash | PASS |
+| test_picker_policy.py::test_picker_parity | PASS |
+| test_picker_policy.py::test_picker_policy_cross_episode_reuse | PASS |
+| test_rollout.py::test_gae_correctness | PASS |
+| test_rollout.py::test_gae_episode_boundary | PASS |
+| test_rollout.py::test_clear | PASS |
+| test_rollout.py::test_gae_smdp_discount | PASS |
+| test_smdp_decision.py::test_smdp_only_decides_when_idle | PASS |
+| test_smdp_decision.py::test_smdp_k_accounting | PASS |
+
+---
+
+**Stage 2 verification** (50-ep sanity, `runs/iac_tarware-tiny-2agvs-1pickers-partialobs-v1_0_0517_1412/`):
+
+| Criterion | Threshold | Actual |
+|-----------|-----------|--------|
+| 50 rows, no crash | ✓ | **✓** |
+| mean pick_rate | ≥ 8 | **18.98** |
+| mask_avg_valid_count_agv mean | < Iter 1 (~12) | **10.01** |
+| picker_busy_ratio mean | ≥ 0.15 | **0.904** |
+
+Pick rate ep 0, 25, 49: 18.72, 20.16, 18.72.
+Pick rate last 10 mean: 18.58 (vs Iter 1 baseline 14–17).
+mask_avg_valid_count_agv: 10.01 (Iter 1 used env's wide mask ≈12, three-state mask tighter as expected).
+
+All Stage 2 criteria passed. Three-state mask now prevents wasteful return-slot selections by carrying AGVs; SMDP discount correctly accounts for option duration. Performance improved vs Iter 1 baseline.
+
+---
+
 ## 2026-05-16
 
 當天工作分三個時段：
