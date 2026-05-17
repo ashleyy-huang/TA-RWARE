@@ -298,6 +298,38 @@ All Stage 2 criteria passed. Three-state mask now prevents wasteful return-slot 
 
 ---
 
+### [20] Phase-1 algo framework refactor (branch `Phase-1-refactor`)
+
+**對應 Plan**: [phase-1-refactor-plan](../Research-Note/wiki/experiments/phase-1-refactor-plan.md). Pure restructure before adding the next algo (joint IAC with picker training). Zero training-logic changes; bit-exact 50-ep parity verified at every stage.
+
+**Commits** (branched off `Phase-1-IAC` @ `574cdb7`):
+
+| Commit | Stage | Summary |
+|--------|-------|---------|
+| `34f39b0` | R1 | Move algo code `tarware/algos/` → top-level `algos/{base,policies,iac}/`. Extract `TrainerBase` from `IACTrainer` with the five SMDP-loop helpers (`_compute_agv_mask`, `_finalize_smdp`, `_decide_agv_action`, `_collect_agv_actions`, `_episode_end_update`). Rename `HyperParams` → `IACHyperParams`. Add `algos/base/registry.py`. Reorganise tests into `tests/{base,policies,iac}/`. **Also added `random.seed/np.random.seed/torch.manual_seed(args.seed)` to `scripts/run_iac.py` — was missing, making prior IAC runs non-reproducible across processes.** |
+| `7ab13bd` | R2 | Add `scripts/train.py` (YAML-config-driven, uses `ALGO_REGISTRY` for trainer lookup, mirrors run_iac.py's seeding order). Add `configs/{iac_tiny,iac_medium,baseline_heuristic_medium}.yaml`. Add `pyyaml` to `pyproject.toml`. Add deprecation comment on `scripts/run_iac.py`. |
+| `79b1ce6` | R3 | Delete `tarware/algos/` and `scripts/run_iac.py`. Add `tests/baseline/test_heuristic_regression.py` — pins heuristic seed=0 medium-env metrics (pick_rate ∈ [49.25, 60.19] from measured 54.72 ± 10%, clash_rate < 1.0, stuck_rate < 1.0). `git mv` canonical merged baseline → `runs/baseline_heuristic/`; plain `mv` for shards + iac dirs. Update `.gitignore` to keep tracking merged baselines under new path. Update `CLAUDE.md` with new architecture section, train.py examples, and a "Baseline isolation invariants" section listing FROZEN files. |
+
+**Determinism gate** (at every stage):
+- R1: `scripts/run_iac.py` 50-ep tiny IAC, seed=0 — bit-exact (13 metrics × 50 episodes) vs a fresh reference captured at `574cdb7` + same seeding patch applied in a `/tmp/ta-rware-574cdb7` worktree.
+- R2: `scripts/train.py --config configs/iac_tiny.yaml --num_episodes 50` — bit-exact (13 metrics × 50 episodes) vs `scripts/run_iac.py` 50-ep with matching args.
+- R3: `scripts/train.py` 50-ep — bit-exact (9 metrics × 50 episodes) vs R2-end sanity run.
+
+**Tests**: 10/10 PASS after R3 (9 existing + new baseline regression).
+
+**FROZEN files** (unchanged across all three commits): `tarware/warehouse.py`, `tarware/heuristic.py`, `tarware/spaces/`, `tarware/definitions.py`, `tarware/rendering.py`, `tarware/utils/`, `tarware/__init__.py`, `scripts/run_heuristic.py`, `scripts/merge_runs.py`. `git log --diff-filter=D ... -- runs/` empty (no run data deleted; merged baseline moved via `git mv` with history preserved).
+
+**Run data layout post-R3**:
+- `runs/baseline_heuristic/heuristic_*_merged_0516_2148/` — canonical baseline (tracked)
+- `runs/baseline_heuristic/heuristic_*/` — shards (gitignored)
+- `runs/iac/iac_*/` — all IAC runs (gitignored)
+
+**Not done in this branch** (intentionally out of scope):
+- R4 merge to `main` — pending user approval
+- R5 joint-IAC (picker training) — new branch off `Phase-1-refactor` after merge
+
+---
+
 ## 2026-05-16
 
 當天工作分三個時段：
