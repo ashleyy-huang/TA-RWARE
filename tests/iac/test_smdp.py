@@ -5,9 +5,10 @@ sys.path.insert(0, "/mnt/sda/home/r147250250916/research/MARL/TA-RWARE")
 
 import gymnasium as gym
 
-from tarware.algos.iac import HyperParams, IACAgent
-from tarware.algos.picker_policy import PickerHeuristicPolicy
-from tarware.algos.trainer import IACTrainer
+from algos.iac.hp import IACHyperParams as HyperParams
+from algos.iac.agent import IACAgent
+from algos.policies.picker_heuristic import PickerHeuristicPolicy
+from algos.iac.trainer import IACTrainer
 from tarware.utils.logger import Logger
 from tarware.warehouse import AgentType
 

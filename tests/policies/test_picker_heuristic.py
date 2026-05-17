@@ -11,7 +11,7 @@ import gymnasium as gym
 import numpy as np
 import pytest
 
-from tarware.algos.picker_policy import PickerHeuristicPolicy
+from algos.policies.picker_heuristic import PickerHeuristicPolicy
 from tarware.heuristic import Mission, MissionType
 from tarware.utils.utils import flatten_list, split_list
 from tarware.warehouse import AgentType

@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, "/mnt/sda/home/r147250250916/research/MARL/TA-RWARE")
 
-from tarware.algos.rollout import NStepRollout, Transition
+from algos.base.rollout import NStepRollout, Transition
 
 
 def _make_dummy_transition(reward, value_scalar, done):

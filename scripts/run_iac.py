@@ -1,10 +1,13 @@
 import os
+import random
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 
 import gymnasium as gym
+import numpy as np
+import torch
 
-from tarware.algos.iac import HyperParams
-from tarware.algos.trainer import IACTrainer
+from algos.iac.hp import IACHyperParams as HyperParams
+from algos.iac.trainer import IACTrainer
 from tarware.utils.logger import Logger
 
 parser = ArgumentParser(
@@ -39,6 +42,10 @@ parser.add_argument("--device", default="cpu")
 
 if __name__ == "__main__":
     args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     if args.picker_mode == "train":
         raise NotImplementedError("picker_mode=train not implemented yet")

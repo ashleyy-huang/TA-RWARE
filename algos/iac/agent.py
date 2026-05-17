@@ -1,30 +1,17 @@
-from dataclasses import dataclass
-
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
 
-from tarware.algos.ac_nets import Actor, Critic
-from tarware.algos.rollout import NStepRollout
-
-
-@dataclass
-class HyperParams:
-    lr: float = 3e-4
-    adam_eps: float = 1e-3
-    gamma: float = 0.99
-    gae_lambda: float = 0.96
-    n_step: int = 5
-    entropy_coef: float = 0.01
-    value_coef: float = 0.5
-    max_grad_norm: float = 0.5
+from algos.base.networks import Actor, Critic
+from algos.base.rollout import NStepRollout
+from algos.iac.hp import IACHyperParams
 
 
 class IACAgent:
     """Independent Actor-Critic agent for a single AGV."""
 
-    def __init__(self, obs_dim: int, action_dim: int, hp: HyperParams):
+    def __init__(self, obs_dim: int, action_dim: int, hp: IACHyperParams):
         self.actor = Actor(obs_dim, action_dim)
         self.critic = Critic(obs_dim)
         self.optim = Adam(
