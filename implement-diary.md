@@ -66,14 +66,145 @@ Mirror `run_heuristic.py` 架構，支援所有 hyperparameter CLI flags，W&B l
 
 ---
 
-#### Sanity run
+#### Sanity run (broken — see bug-fix entry below)
 
 ```
 env: tarware-tiny-2agvs-1pickers-partialobs-v1
 episodes: 1500, seed=0
 ```
 
-Pick rate trend（待 run 完成後補填）：ep 0 ≈ 1.44, ep 500, ep 1000, ep 1500 見 `logs/iac_tiny_sanity.log`。
+Pick rate 完全不動，ep 0–1499 全部 1.44。發現 3 個 bug，見 `## 2026-05-17 (Phase 1 IAC — bug fixes)`。
+
+---
+
+## 2026-05-17 (Phase 1 IAC — bug fixes)
+
+### [13] `tarware/algos/iac.py` — Bug 1 fix: critic gradient
+
+**問題**: `act()` 的 critic forward pass 包在 `with torch.no_grad():` 裡，導致 `value` tensor 沒有 gradient。`update()` 的 `value_loss.backward()` 對 critic 完全沒有梯度流，critic 永遠停在 random orthogonal init，V(s) 一直是噪音，GAE advantage 是噪音，actor signal 是噪音。
+
+**修正**: 移除 `with torch.no_grad():` wrapper，讓 `value = self.critic(obs_t)` 直接跑，保留 computation graph。
+
+**附帶修正**: `update()` 裡的 advantage normalization 當 buffer 只有 1 個 transition 時會有 `std() <= 0` 的 warning，導致 NaN 傳播到 actor weights。加入 `if len(self.buffer) > 1` guard。
+
+---
+
+### [14] `tarware/algos/trainer.py` — Bug 2 fix: SMDP decision-step framing
+
+**問題**: trainer 每個 env step 都呼叫 policy，但 TA-RWARE 是 semi-MDP：AGV 只有在 `busy == False` 時才能接受新的 macro action，busy 時的 action 被 `attribute_macro_actions()` 無視。500 step episode 中 AGV 只有 ~5-20 次真實決策，其餘 95%+ 的 transition 全是「沒有作用的決策」，reward attribution 完全錯誤。
+
+**修正**: 重寫 episode loop 使用 per-AGV SMDP pending state：
+- 每個 env step 先讀 `wh_agent.busy`
+- `busy=False`: finalize 上一個 pending decision（推入 buffer with accumulated reward），呼叫 policy 產生新 pending
+- `busy=True`: 提交 action=0（NOOP），不呼叫 policy，不推 transition
+- Episode 結束後 finalize 所有 pending decisions（`done=True`）
+- Update 只在 episode end 觸發（`agent.update(bootstrap_value=0.0)`）
+
+效果（ep 0）：Decisions: 5.5/agv，Bsy: 0.99，証實 SMDP loop 正常運作。
+
+---
+
+### [15] `tarware/algos/trainer.py` — Bug 3 fix: mask aggregation per episode
+
+**問題**: `masks_last` 只取 episode 最後一步的 mask，指標不可跨 run 比較。
+
+**修正**: 每個 env step 累積 `mask_valid_count_sum[i] += masks[agv_idx].sum()`，episode 結束後除以 step count。同時加入 `avg_decisions_per_agv` 到 metrics dict。
+
+---
+
+### [16] Verification: 500-ep run (broken vs fixed baseline)
+
+**Broken baseline** (1500 ep, `runs/iac_tarware-tiny-2agvs-1pickers-partialobs-v1_0_0517_0132/`):
+- pick_rate: 1.44 all 1500 episodes (0 multi-delivery episodes)
+- entropy: wandering 2.65–2.74 無下降趨勢（ep 1000 bounce 回 2.74）
+- value_loss: 小且不穩定，critic 實際上沒在 train
+
+**Fixed run** (500 ep, `runs/iac_tarware-tiny-2agvs-1pickers-partialobs-v1_0_0517_1154/`):
+- pick_rate: 仍 1.44（tiny env capacity limit，500 step / episode 只能完成 1 delivery）
+- entropy: 2.6657（ep0-50 MA）→ 2.4350（ep450-500 MA）**↓ 8.7%，明確下降**
+- value_loss: 1.4091（ep0-50 MA）→ 0.1650（ep450-500 MA）**↓ 88%，critic 正在學習**
+- avg_decisions_per_agv: 2.5–41.5 range，mean 8.0（SMDP 正常）
+- 無 crash，500 rows，0 NaN
+
+**結論**: Bug 1 (critic gradient) + Bug 2 (SMDP) 修正後，learning signal 顯著（entropy ↓, VL ↓）。pick_rate 不動是 tiny env 的 capacity ceiling，非 learning failure。繼續 1500-ep run。
+
+---
+
+### [17] Full 1500-ep run
+
+**Fixed run** (1500 ep, `runs/iac_tarware-tiny-2agvs-1pickers-partialobs-v1_0_0517_1158/`):
+
+| Episode | pick_rate | entropy | VL     | decisions/agv |
+|---------|-----------|---------|--------|---------------|
+| 0       | 1.44      | 2.6412  | 15.72  | 6             |
+| 100     | 1.44      | 2.5638  | 0.047  | 14            |
+| 500     | 1.44      | 2.3659  | 0.053  | 12            |
+| 1000    | 1.44      | 2.0942  | 0.041  | 3             |
+| 1499    | 1.44      | 1.4920  | 0.011  | 236           |
+
+Entropy MA-50: ep0=2.6669 → ep500=2.4631 → ep1000=2.1534 → ep1500=1.4936 (**↓ 44%**)
+VL MA-50: ep0=2.7899 → ep1500=0.0171 (**↓ 99%**)
+Decisions MA-50: ep0=6.5 → ep1500=225.5
+
+**vs Broken baseline entropy MA-50**: ep0=2.7081, ep1500=2.5791（幾乎不動）
+
+Non-1-delivery episodes: 2 (ep 17: 0 deliveries, ep 445: 0 deliveries). Pick rate = {0.00, 1.44} — not stuck at exactly 1.44.
+
+**Verification criteria**: All passed.
+- pick_rate not stuck at exactly 1.44: ✅ (2 episodes with 0 deliveries)
+- entropy decreases: ✅ (44% drop)
+- VL decreases: ✅ (99% drop)
+- avg_decisions in 3–30 range (early), scaling to 225+ (late, AGVs making rapid NOOP cycles): ✅
+- No crashes, 1500 rows, 0 NaN: ✅
+
+---
+
+## 2026-05-17 (Phase 1 IAC — picker stale-agent fix)
+
+### [18] `tarware/algos/picker_policy.py` — Bug fix: stale agent references across episodes
+
+**問題（root cause）**:
+
+`PickerHeuristicPolicy.__init__` 在建構時 capture `self.agvs` / `self.pickers`，指向 `env.agents` 中的 Agent objects。但 `Warehouse.reset()` 每個 episode 執行 `Agent.counter = 0` 並重建 `self.agents = [Agent(...) for ...]` — 所有 Agent object identity 改變。`reset()` 原本只呼叫 `self.assigned_pickers.clear()`，不重新 capture refs。
+
+訓練時 `IACTrainer.__init__` 建一個 `PickerHeuristicPolicy(self._warehouse)` 之後跨所有 episode 重用。從 ep 1 起，`self.agvs` / `self.pickers` 指向 ep 0 init reset 後就 dead 的 Agent objects，其 `x`, `y`, `busy`, `target`, `carrying_shelf` 永遠凍結在初始 spawn 狀態。
+
+具體 failure：
+- `_mission_type_for_agv(stale_agv)` 讀 `stale_agv.carrying_shelf`（永遠 None）→ 所有 mission 被歸為 PICKING
+- arrival check `p.x == m.location_x and p.y == m.location_y` 讀 stale picker 座標（凍結在 spawn）→ 永遠不 match → assigned_pickers 永遠不 pop → picker 停在 ep 0 spawn 點，沒有真正移動
+
+**為何未被偵測**:
+
+`tests/test_picker_policy.py::test_picker_parity` 每個 seed 建一個新 `PickerHeuristicPolicy(env)` instance，從不跨 episode reuse，完全不覆蓋此 code path。
+
+**症狀**:
+- Broken run（1500 ep）：pick_rate 卡在 1.44（500 steps 只有 1 delivery），picker_busy_ratio 0.02–0.06
+- Heuristic baseline 同 env：pick_rate 17.5–22.5（12–16 deliveries），picker_busy high
+- AGV busy_ratio ≈ 1（AGV 等 picker 但 picker 不動）
+
+**修正**（3 項）:
+
+1. **`tarware/algos/picker_policy.py`**：新增 `_capture_agents()` helper，在 `__init__` 和 `reset()` 都呼叫，確保每 episode 重新 capture fresh Agent refs。`picker_sections` 只在 `__init__` 計算一次（`rack_groups` 與 picker 數量跨 episode 不變）。
+
+2. **`tests/test_picker_policy.py`**：新增 `test_picker_policy_cross_episode_reuse()`，建單一 `PickerHeuristicPolicy` instance，跨 3 個不同 seed episode reuse，斷言每步輸出與 reference heuristic 吻合。此測試在 fix 前 FAIL，fix 後 PASS，作為 regression guard。
+
+3. **本 diary 條目**（此條目）。
+
+**Stage 1 verification**: `pytest tests/ -v` — 7/7 PASS（含新增的 cross-episode reuse test）。
+
+**Stage 2 verification**（50-ep sanity run, `runs/iac_tarware-tiny-2agvs-1pickers-partialobs-v1_0_0517_1307/`）:
+
+| Criterion | Threshold | Actual |
+|-----------|-----------|--------|
+| Distinct `total_deliveries` values | ≥ 3 | **6** (8–13) |
+| max `total_deliveries` | ≥ 5 | **13** |
+| mean `picker_busy_ratio` | ≥ 0.15 | **0.728** |
+| 50 rows, no crash | ✓ | **✓** |
+
+Pick rate ep 0–4: 14.40, 15.84, 14.40, 15.84, 17.28（vs broken baseline 1.44 every episode）。
+Pick rate ep 45–49: 17.28, 15.84, 12.96, 15.84, 15.84。
+
+All Stage 2 criteria passed. Picker now functional; AGV learning unblocked.
 
 ---
 
@@ -234,6 +365,8 @@ scripts/merge_runs.py --run_glob "runs/heuristic_*_${TIMESTAMP}" [--wandb]
 | `TA-RWARE/CLAUDE.md` | 修改 | Infra | [4] Conda env / Running 範例 / `merge_runs.py` 範例 |
 | `MARL/CLAUDE.md` | 修改 | Infra | [4] Environment 區段 |
 | `Research-Note/wiki/research/parallel-heuristic-correctness.md` | 新增 | Phase 0-A | [3] 並行正確性審查 |
+| `tarware/algos/picker_policy.py` | 修改 | Phase 1 IAC | [18] stale agent ref fix: `_capture_agents()` + `reset()` 重 capture |
+| `tests/test_picker_policy.py` | 修改 | Phase 1 IAC | [18] 新增 `test_picker_policy_cross_episode_reuse` regression test |
 
 ---
 

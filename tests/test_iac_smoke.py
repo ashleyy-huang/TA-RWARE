@@ -39,3 +39,4 @@ def test_iac_10_episodes_no_crash(tmp_path):
     assert all("policy_loss_mean" in r for r in rows)
     assert all("value_loss_mean" in r for r in rows)
     assert all("grad_norm_mean" in r for r in rows)
+    assert all("avg_decisions_per_agv" in r for r in rows)

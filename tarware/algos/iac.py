@@ -59,8 +59,7 @@ class IACAgent:
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
 
-        with torch.no_grad():
-            value = self.critic(obs_t)
+        value = self.critic(obs_t)
 
         return int(action.item()), log_prob.squeeze(0), value.squeeze(0), entropy.squeeze(0)
 
@@ -88,8 +87,11 @@ class IACAgent:
             bootstrap_value, hp.gamma, hp.gae_lambda
         )
 
-        # Normalise advantages
-        adv_norm = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Normalise advantages (skip normalisation when only 1 transition)
+        if len(self.buffer) > 1:
+            adv_norm = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        else:
+            adv_norm = advantages
 
         log_probs = torch.stack([t.log_prob for t in self.buffer.transitions])
         entropies = torch.stack([t.entropy for t in self.buffer.transitions])

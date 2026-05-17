@@ -19,19 +19,18 @@ class PickerHeuristicPolicy:
 
     def __init__(self, env):
         self.env = env
-        # env.agents is populated after reset()
-        self.agvs = [a for a in env.agents if a.type == AgentType.AGV]
-        self.pickers = [a for a in env.agents if a.type == AgentType.PICKER]
-
-        # Mirror heuristic.py lines 43-46
-        sections = env.rack_groups
-        picker_sections_raw = split_list(sections, len(self.pickers))
-        self.picker_sections = [flatten_list(l) for l in picker_sections_raw]
-
-        # (picker Agent -> Mission)
         self.assigned_pickers: OrderedDict[Agent, Mission] = OrderedDict()
+        self._capture_agents()
+        sections = env.rack_groups
+        raw = split_list(sections, len(self.pickers))
+        self.picker_sections = [flatten_list(l) for l in raw]
+
+    def _capture_agents(self) -> None:
+        self.agvs = [a for a in self.env.agents if a.type == AgentType.AGV]
+        self.pickers = [a for a in self.env.agents if a.type == AgentType.PICKER]
 
     def reset(self) -> None:
+        self._capture_agents()
         self.assigned_pickers.clear()
 
     def _mission_type_for_agv(self, agv, target_id: int):

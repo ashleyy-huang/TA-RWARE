@@ -22,23 +22,19 @@ class IACTrainer:
         checkpoint_dir: str = None,
     ):
         self.env = env
-        # All internal warehouse state is on the unwrapped env
         self._warehouse = env.unwrapped
         self.hp = hp
         self.logger = logger
         self.seed = seed
         self.checkpoint_dir = checkpoint_dir
 
-        # Populate env.agents via a throwaway reset (env returns obs tuple, no info)
         env.reset(seed=seed)
 
-        # Identify AGV indices in the flat agent list
         self.agv_indices = [
             i for i, a in enumerate(self._warehouse.agents)
             if a.type == AgentType.AGV
         ]
 
-        # One IACAgent per AGV
         obs_dim = env.observation_space[self.agv_indices[0]].shape[0]
         action_dim = env.action_space[self.agv_indices[0]].n
         self.iac_agents = [
@@ -53,37 +49,69 @@ class IACTrainer:
             self.logger.log_episode(ep, ep_metrics)
             if self._is_checkpoint_ep(ep):
                 self._save_checkpoint(ep)
+            avg_dec = ep_metrics.get("avg_decisions_per_agv", 0.0)
             print(
                 f"Episode {ep:5d} | "
-                f"Pick Rate: {ep_metrics['pick_rate']:6.2f} | "
-                f"Deliveries: {ep_metrics['total_deliveries']:3d} | "
+                f"Pick: {ep_metrics['pick_rate']:6.2f} | "
+                f"Deliv: {ep_metrics['total_deliveries']:3d} | "
+                f"Decisions: {avg_dec:5.1f} | "
                 f"Entropy: {ep_metrics['policy_entropy_mean']:.4f} | "
-                f"PL: {ep_metrics['policy_loss_mean']:.4f} | "
-                f"VL: {ep_metrics['value_loss_mean']:.4f}"
+                f"PL: {ep_metrics['policy_loss_mean']:+.4f} | "
+                f"VL: {ep_metrics['value_loss_mean']:.4f} | "
+                f"Bsy: {ep_metrics['agv_busy_ratio']:.2f}"
             )
 
     def _run_episode(self, seed: int) -> dict:
-        # env.reset() returns a tuple of per-agent observations (no info dict)
         obs_tuple = self.env.reset(seed=seed)
         self.picker_policy.reset()
+
+        num_agvs = len(self.agv_indices)
+        # Per-AGV SMDP state: pending decision and accumulated reward
+        smdp = [
+            {"pending": None, "accumulated_reward": 0.0, "decisions": 0}
+            for _ in range(num_agvs)
+        ]
 
         done = False
         episode_returns = np.zeros(self._warehouse.num_agents)
         all_infos = []
-        rollout_step = 0
         total_losses = defaultdict(list)
+
+        # Mask aggregation accumulators (Bug 3 fix)
+        mask_valid_count_sum = np.zeros(num_agvs)
+        mask_step_count = 0
 
         while not done:
             masks = self._warehouse.compute_valid_action_masks()
 
+            # Accumulate mask stats every step (for comparable metric across runs)
+            for i in range(num_agvs):
+                mask_valid_count_sum[i] += float(masks[self.agv_indices[i]].sum())
+            mask_step_count += 1
+
             agv_actions = []
             for i, agent in enumerate(self.iac_agents):
-                obs = obs_tuple[self.agv_indices[i]]
-                mask = masks[self.agv_indices[i]]
-                action, log_prob, value, entropy = agent.act(obs, mask)
-                agv_actions.append(action)
-                # Store with placeholder reward/done; filled in after step
-                agent.store(obs, action, log_prob, value, entropy, 0.0, False)
+                wh_agent = self._warehouse.agents[self.agv_indices[i]]
+                if not wh_agent.busy:
+                    # Finalize previous pending decision if any
+                    if smdp[i]["pending"] is not None:
+                        obs_p, act_p, lp_p, val_p, ent_p = smdp[i]["pending"]
+                        agent.store(
+                            obs_p, act_p, lp_p, val_p, ent_p,
+                            smdp[i]["accumulated_reward"], False,
+                        )
+                        smdp[i]["accumulated_reward"] = 0.0
+
+                    # Make a new decision
+                    obs_i = obs_tuple[self.agv_indices[i]]
+                    mask_i = masks[self.agv_indices[i]]
+                    action, log_prob, value, entropy = agent.act(obs_i, mask_i)
+                    smdp[i]["pending"] = (obs_i, action, log_prob, value, entropy)
+                    smdp[i]["decisions"] += 1
+                    agv_actions.append(action)
+                else:
+                    # AGV busy: submit NOOP, do not call policy
+                    agv_actions.append(0)
 
             picker_actions = self.picker_policy.act(agv_actions)
             full_actions = [int(a) for a in agv_actions] + picker_actions
@@ -91,35 +119,43 @@ class IACTrainer:
             obs_tuple, rewards, terms, truncs, info = self.env.step(full_actions)
             done = all(terms) or all(truncs)
 
-            # Back-fill reward and done into the just-stored transition
-            for i, agent in enumerate(self.iac_agents):
-                agent.buffer.transitions[-1].reward = float(rewards[self.agv_indices[i]])
-                agent.buffer.transitions[-1].done = done
-
             episode_returns += np.array(rewards, dtype=np.float64)
             all_infos.append(info)
-            rollout_step += 1
 
-            # n-step update or episode end
-            if rollout_step >= self.hp.n_step or done:
-                for i, agent in enumerate(self.iac_agents):
-                    if done:
-                        bootstrap = 0.0
-                    else:
-                        with torch.no_grad():
-                            obs_t = torch.tensor(
-                                obs_tuple[self.agv_indices[i]], dtype=torch.float32
-                            ).unsqueeze(0)
-                            bootstrap = float(agent.critic(obs_t).item())
-                    if len(agent.buffer) > 0:
-                        losses = agent.update(bootstrap)
-                        for k, v in losses.items():
-                            total_losses[k].append(v)
-                rollout_step = 0
+            # Accumulate per-AGV rewards into SMDP state
+            for i in range(num_agvs):
+                smdp[i]["accumulated_reward"] += float(rewards[self.agv_indices[i]])
 
-        return self._build_episode_metrics(all_infos, episode_returns, total_losses, masks)
+        # Finalize all pending decisions at episode end with done=True
+        for i, agent in enumerate(self.iac_agents):
+            if smdp[i]["pending"] is not None:
+                obs_p, act_p, lp_p, val_p, ent_p = smdp[i]["pending"]
+                agent.store(
+                    obs_p, act_p, lp_p, val_p, ent_p,
+                    smdp[i]["accumulated_reward"], True,
+                )
+                smdp[i]["pending"] = None
+                smdp[i]["accumulated_reward"] = 0.0
 
-    def _build_episode_metrics(self, all_infos, episode_returns, total_losses, masks_last) -> dict:
+        # Episode-end update for each AGV
+        for i, agent in enumerate(self.iac_agents):
+            if len(agent.buffer) > 0:
+                losses = agent.update(bootstrap_value=0.0)
+                for k, v in losses.items():
+                    total_losses[k].append(v)
+
+        avg_decisions = float(np.mean([s["decisions"] for s in smdp]))
+        mask_valid_counts = (mask_valid_count_sum / max(mask_step_count, 1)).tolist()
+
+        return self._build_episode_metrics(
+            all_infos, episode_returns, total_losses,
+            mask_valid_counts, avg_decisions,
+        )
+
+    def _build_episode_metrics(
+        self, all_infos, episode_returns, total_losses,
+        mask_valid_counts, avg_decisions,
+    ) -> dict:
         total_deliveries = sum(i["shelf_deliveries"] for i in all_infos)
         total_clashes = sum(i["clashes"] for i in all_infos)
         total_stuck = sum(i["stucks"] for i in all_infos)
@@ -145,8 +181,6 @@ class IACTrainer:
             for j in range(wh.num_pickers)
         ]
 
-        mask_valid_counts = [float(masks_last[j].sum()) for j in range(wh.num_agvs)]
-
         return {
             "pick_rate": pick_rate,
             "global_return": float(episode_returns.sum()),
@@ -161,11 +195,24 @@ class IACTrainer:
             "picker_busy_ratio": float(np.mean(picker_busy)),
             "mask_avg_valid_count_agv": float(np.mean(mask_valid_counts)),
             "mask_avg_valid_count_per_agv": mask_valid_counts,
+            "avg_decisions_per_agv": avg_decisions,
             **travel_time_metrics,
-            "policy_loss_mean": float(np.mean(total_losses["policy_loss"])) if total_losses["policy_loss"] else 0.0,
-            "value_loss_mean": float(np.mean(total_losses["value_loss"])) if total_losses["value_loss"] else 0.0,
-            "policy_entropy_mean": float(np.mean(total_losses["entropy"])) if total_losses["entropy"] else 0.0,
-            "grad_norm_mean": float(np.mean(total_losses["grad_norm"])) if total_losses["grad_norm"] else 0.0,
+            "policy_loss_mean": (
+                float(np.mean(total_losses["policy_loss"]))
+                if total_losses["policy_loss"] else 0.0
+            ),
+            "value_loss_mean": (
+                float(np.mean(total_losses["value_loss"]))
+                if total_losses["value_loss"] else 0.0
+            ),
+            "policy_entropy_mean": (
+                float(np.mean(total_losses["entropy"]))
+                if total_losses["entropy"] else 0.0
+            ),
+            "grad_norm_mean": (
+                float(np.mean(total_losses["grad_norm"]))
+                if total_losses["grad_norm"] else 0.0
+            ),
         }
 
     def _is_checkpoint_ep(self, ep: int) -> bool:

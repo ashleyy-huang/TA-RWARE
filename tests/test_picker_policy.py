@@ -229,3 +229,27 @@ def test_picker_parity():
                 break
 
     env.close()
+
+
+def test_picker_policy_cross_episode_reuse():
+    env = gym.make(ENV_ID).unwrapped
+    env.reset(seed=99)
+    picker_policy = PickerHeuristicPolicy(env)
+
+    for seed in [0, 1, 2]:
+        ref_actions = collect_actions_from_heuristic(env, seed)
+
+        env.reset(seed=seed)
+        picker_policy.reset()
+
+        for step_idx, (agv_acts, ref_picker_acts) in enumerate(ref_actions):
+            pred = picker_policy.act(agv_acts)
+            assert pred == ref_picker_acts, (
+                f"seed={seed} step={step_idx}: expected {ref_picker_acts}, got {pred}"
+            )
+            full_acts = agv_acts + pred
+            _, _, terminated, truncated, _ = env.step(full_acts)
+            if all(terminated) or all(truncated):
+                break
+
+    env.close()
